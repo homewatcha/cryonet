@@ -1,0 +1,163 @@
+load std.strings: split, trim, index_of, index_of_from, slice, starts_with
+
+public struct MultipartPart {
+    name: string
+    filename: string?
+    content_type: string
+    data: bytes
+}
+
+public class Multipart {
+    parts: MultipartPart[]
+
+    public fun init(parts: MultipartPart[] = []) {
+        rewrite this.parts = parts
+    }
+
+    public fun get(name: string) -> MultipartPart? {
+        for i in 0..this.parts.len() {
+            if this.parts[i].name == name {
+                return this.parts[i]
+            }
+        }
+        return null
+    }
+
+    public fun get_data(name: string) -> bytes? {
+        set p = this.get(name)
+        if p == null { return null }
+        return (p ?? MultipartPart { name: "", filename: null, content_type: "", data: cast("", "bytes") }).data
+    }
+
+    public fun get_text(name: string) -> string? {
+        set d = this.get_data(name)
+        if d == null { return null }
+        return cast(d ?? cast("", "bytes"), "string")
+    }
+
+    public fun has(name: string) -> bool {
+        return this.get(name) != null
+    }
+
+    public fun get_filename(name: string) -> string? {
+        set p = this.get(name)
+        if p == null { return null }
+        return (p ?? MultipartPart { name: "", filename: null, content_type: "", data: cast("", "bytes") }).filename
+    }
+
+    public fun get_field(name: string) -> string? {
+        return this.get_text(name)
+    }
+
+    public fun get_file(name: string) -> MultipartPart? {
+        set p = this.get(name)
+        if p == null { return null }
+        set part = p ?? MultipartPart { name: "", filename: null, content_type: "", data: cast("", "bytes") }
+        if part.filename != null { return p }
+        return null
+    }
+
+    public fun all() -> MultipartPart[] {
+        return this.parts
+    }
+}
+
+fun extract_quoted_param(header: string, param_name: string) -> string? {
+    set search = "${param_name}=\""
+    set idx = index_of(header, search)
+    if idx == null { return null }
+    set start = (idx ?? 0) + search.len()
+    set rest = slice(header, start, header.len())
+    set end_quote = index_of(rest, "\"")
+    if end_quote == null { return null }
+    return slice(rest, 0, end_quote ?? 0)
+}
+
+public fun parse_multipart_bytes(raw_bytes: bytes, content_type_header: string) -> Multipart {
+    set bound_tag = "boundary="
+    set bound_idx = index_of(content_type_header, bound_tag)
+    set boundary = ""
+    if bound_idx != null {
+        set b_pos = bound_idx ?? 0
+        set raw_boundary = trim(slice(content_type_header, b_pos + bound_tag.len(), content_type_header.len()))
+        rewrite boundary = if (starts_with(raw_boundary, "\"") ?? false) && raw_boundary.len() > 1 {
+            slice(raw_boundary, 1, raw_boundary.len() - 1)
+        } else {
+            raw_boundary
+        }
+    } else {
+        rewrite boundary = trim(content_type_header)
+    }
+    if boundary.len() == 0 { return init Multipart([]) }
+
+    set delimiter = "--${boundary}"
+    set raw_len = raw_bytes.len()
+    if raw_len == 0 { return init Multipart([]) }
+    set raw_base_ptr: ptr<uint8> = raw_bytes.as_ptr()
+    set raw_str: string = cast(raw_bytes, "string")
+
+    set result: MultipartPart[] = []
+    set cur_idx = index_of(raw_str, delimiter)
+    if cur_idx == null { return init Multipart([]) }
+
+    while cur_idx != null && (cur_idx ?? 0) < raw_len {
+        set c_idx = cur_idx ?? 0
+        set part_start = c_idx + delimiter.len()
+        if part_start >= raw_len { break }
+        if part_start + 1 < raw_len && slice(raw_str, part_start, part_start + 2) == "--" {
+            break
+        }
+        if part_start + 1 < raw_len && slice(raw_str, part_start, part_start + 2) == "\r\n" {
+            rewrite part_start += 2
+        }
+
+        set next_delim = index_of_from(raw_str, delimiter, part_start)
+        set part_end: int64 = if next_delim != null { next_delim ?? 0 } else { raw_len }
+
+        set head_end = index_of_from(raw_str, "\r\n\r\n", part_start)
+        if head_end != null && (head_end ?? 0) < part_end {
+            set h_end = head_end ?? 0
+            set head_text = slice(raw_str, part_start, h_end)
+            set body_start = h_end + 4
+            set body_end = part_end
+            if body_end >= body_start + 2 && slice(raw_str, body_end - 2, body_end) == "\r\n" {
+                rewrite body_end -= 2
+            }
+
+            set body_len: int64 = if body_end > body_start { body_end - body_start } else { 0 }
+            set part_bytes: bytes = cast("", "bytes")
+            if body_len > 0 {
+                set addr: uint64 = cast(raw_base_ptr, "uint64") + cast(body_start, "uint64")
+                set p: ptr<uint8> = cast(addr, "ptr<uint8>")
+                rewrite part_bytes = from_raw_parts(p, body_len, body_len)
+            }
+
+            set part_name = extract_quoted_param(head_text, "name") ?? ""
+            set part_filename = extract_quoted_param(head_text, "filename")
+            set ct_idx = index_of(head_text, "Content-Type:")
+            set ct_val = "text/plain"
+            if ct_idx != null {
+                set ct_pos = ct_idx ?? 0
+                set ct_rest = slice(head_text, ct_pos + 13, head_text.len())
+                set ct_end = index_of(ct_rest, "\r\n")
+                rewrite ct_val = trim(if ct_end != null { slice(ct_rest, 0, ct_end ?? 0) } else { ct_rest })
+            }
+
+            result.push(MultipartPart {
+                name: part_name,
+                filename: part_filename,
+                content_type: ct_val,
+                data: part_bytes
+            })
+        }
+
+        rewrite cur_idx = next_delim
+    }
+
+    return init Multipart(result)
+}
+
+public fun parse_multipart(raw: string, content_type_header: string) -> Multipart {
+    set b: bytes = cast(raw, "bytes")
+    return parse_multipart_bytes(b, content_type_header)
+}

@@ -1,0 +1,18 @@
+load ..context: Context, ContextError
+load ..response: Response, response_text, response_server_error
+
+public fun recovery_middleware(ctx: Context, next: fun(Context) -> Response) -> Response {
+    set res: Response? = null
+    sus {
+        rewrite res = next(ctx)
+    } catch err: ContextError {
+        set status_code: int32 = cast(400, "int32")
+        if err.code > 0 {
+            rewrite status_code = err.code
+        }
+        rewrite res = response_text(err.message, status_code)
+    } catch {
+        rewrite res = response_server_error("Internal Server Error")
+    }
+    return res ?? response_server_error("Internal Server Error")
+}

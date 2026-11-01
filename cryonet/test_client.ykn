@@ -1,0 +1,105 @@
+load std.net.http_types: HttpHeaders
+load std.json: json_stringify
+load std.json_parser.value: JsonValue
+load std.strings: index_of, slice
+load std.simpleurl: parse_query, QueryParam
+load .router: Router
+load .request: Request
+load .response: Response
+
+public class TestClient {
+    router: Router
+
+    public fun init(router: Router) {
+        rewrite this.router = router
+    }
+
+    public fun request(
+        method: string,
+        uri: string,
+        headers: HttpHeaders? = null,
+        body_text: string = "",
+        body_bytes: bytes? = null,
+        is_binary: bool = false
+    ) -> Response {
+        set q_mark = index_of(uri, "?")
+        set path: string = if q_mark != null { slice(uri, 0, q_mark ?? 0) } else { uri }
+        set q_params: QueryParam[] = []
+        if q_mark != null {
+            rewrite q_params = parse_query(slice(uri, (q_mark ?? 0) + 1, uri.len()))
+        }
+        set req = init Request(
+            method,
+            uri,
+            path,
+            headers,
+            body_text,
+            body_bytes,
+            is_binary,
+            q_params,
+            [],
+            "127.0.0.1:54321",
+            "",
+            uri
+        )
+        return this.router.dispatch(req)
+    }
+
+    public fun get(uri: string) -> Response {
+        return this.request("GET", uri, null, "", null, false)
+    }
+
+    public fun get_headers(uri: string, headers: HttpHeaders) -> Response {
+        return this.request("GET", uri, headers, "", null, false)
+    }
+
+    public fun post(uri: string, body: string) -> Response {
+        return this.request("POST", uri, null, body, null, false)
+    }
+
+    public fun post_headers(uri: string, body: string, headers: HttpHeaders) -> Response {
+        return this.request("POST", uri, headers, body, null, false)
+    }
+
+    public fun post_bytes(uri: string, data: bytes, mime: string = "application/octet-stream") -> Response {
+        set h = init HttpHeaders()
+        h.set("Content-Type", mime)
+        h.set("Content-Length", cast(data.len(), "string"))
+        return this.request("POST", uri, h, "", data, true)
+    }
+
+    public fun post_json(uri: string, val: JsonValue) -> Response {
+        set h = init HttpHeaders()
+        h.set("Content-Type", "application/json; charset=utf-8")
+        set payload = json_stringify(val)
+        return this.request("POST", uri, h, payload, null, false)
+    }
+
+    public fun put(uri: string, body: string) -> Response {
+        return this.request("PUT", uri, null, body, null, false)
+    }
+
+    public fun delete(uri: string) -> Response {
+        return this.request("DELETE", uri, null, "", null, false)
+    }
+
+    public fun patch(uri: string, body: string) -> Response {
+        return this.request("PATCH", uri, null, body, null, false)
+    }
+
+    public fun head(uri: string) -> Response {
+        return this.request("HEAD", uri, null, "", null, false)
+    }
+
+    public fun options(uri: string) -> Response {
+        return this.request("OPTIONS", uri, null, "", null, false)
+    }
+
+    public fun dispatch(req: Request) -> Response {
+        return this.router.dispatch(req)
+    }
+}
+
+public fun test_client(router: Router) -> TestClient {
+    return init TestClient(router)
+}

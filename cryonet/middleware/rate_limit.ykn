@@ -1,0 +1,167 @@
+load std.sync: Mutex, mutex
+load std.datetime: steady_nanos
+load std.strings: index_of, slice
+load std.numf: parse_base
+load ..context: Context
+load ..response: Response, response_new
+load .pipeline: MiddlewareFn, NextFn
+
+cfun yukistd_map_new() -> ptr<uint8>
+cfun yukistd_map_free(m: ptr<uint8>)
+cfun yukistd_map_set(m: ptr<uint8>, k_ptr: ptr<uint8>, k_len: int64, v_ptr: ptr<uint8>, v_len: int64)
+cfun yukistd_map_get(m: ptr<uint8>, k_ptr: ptr<uint8>, k_len: int64, out_len: ptr<int64>) -> ptr<uint8>
+cfun yukistd_map_del(m: ptr<uint8>, k_ptr: ptr<uint8>, k_len: int64) -> bool
+cfun yukistd_map_clear(m: ptr<uint8>)
+
+public class RateLimiter {
+    lock: Mutex
+    handle: ptr<uint8>
+    max_requests: int64
+    window_ms: int64
+    by_ip: bool
+    trust_proxy: bool
+    keys: string[]
+    last_cleanup_ms: int64
+
+    public fun init(max_requests: int64, window_ms: int64, by_ip: bool = true, trust_proxy: bool = false) {
+        rewrite this.lock = mutex()
+        rewrite this.handle = yukistd_map_new()
+        rewrite this.max_requests = max_requests
+        rewrite this.window_ms = window_ms
+        rewrite this.by_ip = by_ip
+        rewrite this.trust_proxy = trust_proxy
+        rewrite this.keys = []
+        rewrite this.last_cleanup_ms = steady_nanos() / 1000000
+    }
+
+    fun cleanup(now_ms: int64) {
+        set active_keys: string[] = []
+        for i in 0..this.keys.len() {
+            set k = this.keys[i]
+            set out_len: int64 = 0
+            set p = yukistd_map_get(this.handle, k.as_ptr(), k.len(), ptr_of(out_len))
+            if p != null && out_len > 0 {
+                set raw_val: string = "" + from_raw_parts(p, out_len)
+                set colon_pos = index_of(raw_val, ":")
+                if colon_pos != null && (colon_pos ?? 0) > 0 {
+                    set c_idx = colon_pos ?? 0
+                    set prev_reset_str = slice(raw_val, c_idx + 1, raw_val.len())
+                    set prev_reset = parse_base(prev_reset_str, 10) ?? 0
+                    if now_ms < prev_reset {
+                        active_keys.push(k)
+                    } else {
+                        yukistd_map_del(this.handle, k.as_ptr(), k.len())
+                    }
+                }
+            }
+        }
+        rewrite this.keys = active_keys
+        rewrite this.last_cleanup_ms = now_ms
+    }
+
+    public fun check(ctx: Context) -> Response? {
+        set client_key: string = if this.by_ip {
+            ctx.client_ip_opt(this.trust_proxy) ?? "unknown_client"
+        } else {
+            "global_client"
+        }
+
+        set now_ms = steady_nanos() / 1000000
+
+        this.lock.lock()
+        if now_ms - this.last_cleanup_ms > this.window_ms {
+            this.cleanup(now_ms)
+        }
+
+        set out_len: int64 = 0
+        set p = yukistd_map_get(this.handle, client_key.as_ptr(), client_key.len(), ptr_of(out_len))
+
+        set count: int64 = 1
+        set reset_time_ms: int64 = now_ms + this.window_ms
+
+        if p != null && out_len > 0 {
+            set raw_val: string = "" + from_raw_parts(p, out_len)
+            set colon_pos = index_of(raw_val, ":")
+            if colon_pos != null && (colon_pos ?? 0) > 0 {
+                set c_idx = colon_pos ?? 0
+                set prev_count_str = slice(raw_val, 0, c_idx)
+                set prev_reset_str = slice(raw_val, c_idx + 1, raw_val.len())
+                set prev_count = parse_base(prev_count_str, 10) ?? 0
+                set prev_reset = parse_base(prev_reset_str, 10) ?? 0
+
+                if now_ms < prev_reset {
+                    if prev_count >= this.max_requests {
+                        this.lock.unlock()
+                        set retry_after = (prev_reset - now_ms) / 1000 + 1
+                        set resp429 = response_new(429, "429 Too Many Requests")
+                        resp429.header("Retry-After", cast(retry_after, "string"))
+                        resp429.header("X-RateLimit-Limit", cast(this.max_requests, "string"))
+                        resp429.header("X-RateLimit-Remaining", "0")
+                        return resp429
+                    }
+                    rewrite count = prev_count + 1
+                    rewrite reset_time_ms = prev_reset
+                }
+            }
+        } else {
+            this.keys.push(client_key)
+        }
+
+        set new_val = "${count}:${reset_time_ms}"
+        yukistd_map_set(this.handle, client_key.as_ptr(), client_key.len(), new_val.as_ptr(), new_val.len())
+        this.lock.unlock()
+        return null
+    }
+
+    public fun remaining(ctx: Context) -> int64 {
+        set client_key: string = if this.by_ip {
+            ctx.client_ip_opt(this.trust_proxy) ?? "unknown_client"
+        } else {
+            "global_client"
+        }
+        set now_ms = steady_nanos() / 1000000
+
+        this.lock.lock()
+        set out_len: int64 = 0
+        set p = yukistd_map_get(this.handle, client_key.as_ptr(), client_key.len(), ptr_of(out_len))
+        if p == null || out_len <= 0 {
+            this.lock.unlock()
+            return this.max_requests
+        }
+        set raw_val: string = "" + from_raw_parts(p, out_len)
+        this.lock.unlock()
+
+        set colon_pos = index_of(raw_val, ":")
+        if colon_pos == null || (colon_pos ?? 0) <= 0 { return this.max_requests }
+        set c_idx = colon_pos ?? 0
+
+        set count_str = slice(raw_val, 0, c_idx)
+        set reset_str = slice(raw_val, c_idx + 1, raw_val.len())
+        set cnt = parse_base(count_str, 10) ?? 0
+        set rst = parse_base(reset_str, 10) ?? 0
+
+        if now_ms >= rst { return this.max_requests }
+        set rem = this.max_requests - cnt
+        return if rem < 0 { 0 } else { rem }
+    }
+}
+
+public fun rate_limit_middleware(
+    max_requests: int64,
+    window_ms: int64,
+    by_ip: bool = true,
+    trust_proxy: bool = false
+) -> MiddlewareFn {
+    set limiter = init RateLimiter(max_requests, window_ms, by_ip, trust_proxy)
+    return fun(ctx: Context, next: NextFn) => {
+        set rejected = limiter.check(ctx)
+        if rejected != null {
+            return rejected ?? response_new(429, "Too Many Requests")
+        }
+        set resp = next(ctx)
+        set rem = limiter.remaining(ctx)
+        resp.header("X-RateLimit-Limit", cast(max_requests, "string"))
+        resp.header("X-RateLimit-Remaining", cast(rem, "string"))
+        return resp
+    }
+}

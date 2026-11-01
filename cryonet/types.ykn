@@ -1,0 +1,66 @@
+load std.strings: split, trim, index_of, slice
+
+public struct Cookie {
+    name: string
+    value: string
+    path: string
+    domain: string
+    max_age: int64
+    http_only: bool
+    secure: bool
+    same_site: string
+}
+
+public fun cookie_new(name: string, value: string) -> Cookie {
+    return Cookie {
+        name: name,
+        value: value,
+        path: "/",
+        domain: "",
+        max_age: -1,
+        http_only: false,
+        secure: false,
+        same_site: "Lax"
+    }
+}
+
+public fun cookie_format(c: Cookie) -> string {
+    set res = "${c.name}=${c.value}"
+    if c.path.len() > 0 {
+        rewrite res = "${res}; Path=${c.path}"
+    }
+    if c.domain.len() > 0 {
+        rewrite res = "${res}; Domain=${c.domain}"
+    }
+    if c.max_age >= 0 {
+        set age: int64 = c.max_age
+        rewrite res = "${res}; Max-Age=${age}"
+    }
+    if c.http_only {
+        rewrite res = "${res}; HttpOnly"
+    }
+    if c.secure {
+        rewrite res = "${res}; Secure"
+    }
+    if c.same_site.len() > 0 {
+        rewrite res = "${res}; SameSite=${c.same_site}"
+    }
+    return res
+}
+
+public fun cookie_parse(raw: string) -> Cookie[] {
+    set result: Cookie[] = []
+    set parts = split(raw, ";")
+    for i in 0..parts.len() {
+        set part = trim(parts[i])
+        if part.len() == 0 { continue }
+        set eq = index_of(part, "=")
+        if eq != null && (eq ?? 0) > 0 {
+            set eq_idx = eq ?? 0
+            set k = trim(slice(part, 0, eq_idx))
+            set v = trim(slice(part, eq_idx + 1, part.len()))
+            result.push(cookie_new(k, v))
+        }
+    }
+    return result
+}

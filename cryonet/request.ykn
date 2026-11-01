@@ -1,0 +1,221 @@
+load std.net.http_types: HttpHeaders
+load std.simpleurl: QueryParam, parse_query
+load std.json: json_try_parse
+load std.json_parser.value: JsonValue
+load std.strings: starts_with, slice, trim, index_of
+load std.numf: parse_base
+load .types: Cookie, cookie_parse
+load .form: Form, parse_form
+load .multipart: Multipart, parse_multipart, parse_multipart_bytes
+
+public struct RouteParam {
+    name: string
+    value: string
+}
+
+public class Request {
+    method: string
+    uri: string
+    path: string
+    headers: HttpHeaders
+    body_text: string
+    body_bytes: bytes?
+    is_binary: bool
+    query_params: QueryParam[]
+    params: RouteParam[]
+    client_addr: string
+    matched_path: string
+    original_uri: string
+
+    public fun init(
+        method: string,
+        uri: string,
+        path: string,
+        headers: HttpHeaders? = null,
+        body_text: string = "",
+        body_bytes: bytes? = null,
+        is_binary: bool = false,
+        query_params: QueryParam[] = [],
+        params: RouteParam[] = [],
+        client_addr: string = "127.0.0.1:0",
+        matched_path: string = "",
+        original_uri: string = ""
+    ) {
+        rewrite this.method = method
+        rewrite this.uri = uri
+        rewrite this.path = path
+        rewrite this.headers = headers ?? init HttpHeaders()
+        rewrite this.body_text = body_text
+        rewrite this.body_bytes = body_bytes
+        rewrite this.is_binary = is_binary
+        set resolved_qp: QueryParam[] = query_params
+        if resolved_qp.len() == 0 {
+            set q_idx = index_of(uri, "?")
+            if q_idx != null {
+                set raw_q = slice(uri, (q_idx ?? 0) + 1, uri.len())
+                rewrite resolved_qp = parse_query(raw_q)
+            }
+        }
+        rewrite this.query_params = resolved_qp
+        rewrite this.params = params
+        rewrite this.client_addr = client_addr
+        rewrite this.matched_path = matched_path
+        rewrite this.original_uri = if original_uri.len() > 0 { original_uri } else { uri }
+    }
+
+    public fun param(name: string) -> string? {
+        for i in 0..this.params.len() {
+            if this.params[i].name == name {
+                return this.params[i].value
+            }
+        }
+        return null
+    }
+
+    public fun param_int(name: string) -> int32? {
+        set val = this.param(name)
+        if val == null { return null }
+        set non_null = val ?? ""
+        set parsed = parse_base(non_null, 10)
+        if parsed == null { return null }
+        return cast(parsed ?? 0, "int32")
+    }
+
+    public fun param_i64(name: string) -> int64? {
+        set val = this.param(name)
+        if val == null { return null }
+        set non_null = val ?? ""
+        return parse_base(non_null, 10)
+    }
+
+    public fun set_param(name: string, value: string) {
+        for i in 0..this.params.len() {
+            if this.params[i].name == name {
+                rewrite this.params[i] = RouteParam { name: name, value: value }
+                return
+            }
+        }
+        this.params.push(RouteParam { name: name, value: value })
+    }
+
+    public fun set_body(content: string) -> Request {
+        rewrite this.body_text = content
+        set b: bytes = cast(content, "bytes")
+        rewrite this.body_bytes = b
+        rewrite this.is_binary = false
+        return this
+    }
+
+    public fun set_bytes(data: bytes) -> Request {
+        rewrite this.body_bytes = data
+        set s: string = cast(data, "string")
+        rewrite this.body_text = s
+        rewrite this.is_binary = true
+        return this
+    }
+
+    public fun query(name: string) -> string? {
+        for i in 0..this.query_params.len() {
+            if this.query_params[i].key == name {
+                return this.query_params[i].value
+            }
+        }
+        return null
+    }
+
+    public fun query_int(name: string) -> int32? {
+        set val = this.query(name)
+        if val == null { return null }
+        set non_null = val ?? ""
+        set parsed = parse_base(non_null, 10)
+        if parsed == null { return null }
+        return cast(parsed ?? 0, "int32")
+    }
+
+    public fun query_bool(name: string) -> bool? {
+        set val = this.query(name)
+        if val == null { return null }
+        set s = val ?? ""
+        if s == "true" || s == "1" { return true }
+        if s == "false" || s == "0" { return false }
+        return null
+    }
+
+    public fun header(name: string) -> string? {
+        return this.headers.get(name)
+    }
+
+    public fun has_header(name: string) -> bool {
+        return this.headers.has(name)
+    }
+
+    public fun queries() -> QueryParam[] {
+        return this.query_params
+    }
+
+    public fun raw_query() -> string? {
+        set q_pos = index_of(this.uri, "?")
+        if q_pos != null {
+            return slice(this.uri, (q_pos ?? 0) + 1, this.uri.len())
+        }
+        return null
+    }
+
+    public fun cookie(name: string) -> string? {
+        set raw = this.header("Cookie")
+        if raw == null { return null }
+        set cookies = cookie_parse(raw ?? "")
+        for i in 0..cookies.len() {
+            if cookies[i].name == name {
+                return cookies[i].value
+            }
+        }
+        return null
+    }
+
+    public fun cookies() -> Cookie[] {
+        set raw = this.header("Cookie")
+        if raw == null { return [] }
+        return cookie_parse(raw ?? "")
+    }
+
+    public fun bearer_token() -> string? {
+        set auth = this.header("Authorization")
+        if auth == null { return null }
+        set s = trim(auth ?? "")
+        if starts_with(s, "Bearer ") ?? false {
+            return trim(slice(s, 7, s.len()))
+        }
+        return null
+    }
+
+    public fun text() -> string {
+        if this.is_binary && this.body_bytes != null {
+            set b = this.body_bytes ?? cast("", "bytes")
+            return cast(b, "string")
+        }
+        return this.body_text
+    }
+
+    public fun bytes() -> bytes {
+        if this.is_binary && this.body_bytes != null {
+            return this.body_bytes ?? cast("", "bytes")
+        }
+        return cast(this.body_text, "bytes")
+    }
+
+    public fun json() -> JsonValue? {
+        set t = this.text()
+        if t.len() == 0 { return null }
+        return json_try_parse(t)
+    }
+
+    public fun form() -> Form {
+        return parse_form(this.text())
+    }
+
+    public fun multipart() -> Multipart {
+        set ct = this.header("Content-Type") ?? ""
+        return parse_multipart_bytes(this.bytes(), ct)
+    }
+}

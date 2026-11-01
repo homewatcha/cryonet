@@ -1,0 +1,40 @@
+load ..context: Context
+load ..response: Response
+
+public type NextFn = fun(Context) -> Response
+public type MiddlewareFn = fun(Context, NextFn) -> Response
+
+public class PipelineRunner {
+    middlewares: MiddlewareFn[]
+    final_handler: fun(Context) -> Response
+
+    public fun init(middlewares: MiddlewareFn[], final_handler: fun(Context) -> Response) {
+        rewrite this.middlewares = middlewares
+        rewrite this.final_handler = final_handler
+    }
+
+    public fun run_step(current: int64, c: Context) -> Response {
+        if current >= this.middlewares.len() {
+            set fh: fun(Context) -> Response = this.final_handler
+            return fh(c)
+        }
+        set mw: MiddlewareFn = this.middlewares[current]
+        set runner = this
+        set next_fn = fun(next_c: Context) -> Response {
+            return runner.run_step(current + 1, next_c)
+        }
+        return mw(c, next_fn)
+    }
+}
+
+public fun execute_pipeline(
+    ctx: Context,
+    middlewares: MiddlewareFn[],
+    final_handler: fun(Context) -> Response
+) -> Response {
+    if middlewares.len() == 0 {
+        return final_handler(ctx)
+    }
+    set runner = init PipelineRunner(middlewares, final_handler)
+    return runner.run_step(0, ctx)
+}

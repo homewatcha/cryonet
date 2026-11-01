@@ -1,0 +1,150 @@
+load std.net.tcp: TcpStream
+load std.net.tls: TlsStream
+
+public class ConnectionStream {
+    tcp: TcpStream?
+    tls: TlsStream?
+    is_closed: bool
+
+    public fun init() {
+        rewrite this.tcp = null
+        rewrite this.tls = null
+        rewrite this.is_closed = false
+    }
+
+    public fun init_tcp(stream: TcpStream) {
+        rewrite this.tcp = stream
+        rewrite this.tls = null
+        rewrite this.is_closed = false
+    }
+
+    public fun init_tls(tls: TlsStream) {
+        rewrite this.tcp = null
+        rewrite this.tls = tls
+        rewrite this.is_closed = false
+    }
+
+    public fun init_tls_with_tcp(tls: TlsStream, tcp: TcpStream) {
+        rewrite this.tcp = tcp
+        rewrite this.tls = tls
+        rewrite this.is_closed = false
+    }
+
+    public fun is_tls() -> bool {
+        return this.tls != null
+    }
+
+    public fun is_valid() -> bool {
+        return !this.is_closed && (this.tcp != null || this.tls != null)
+    }
+
+    public fun read(max_len: int64 = 65536) -> string {
+        if this.is_closed { return "" }
+        if this.tls != null {
+            set s = this.tls ?? init TlsStream(0)
+            return s.read(max_len)
+        }
+        if this.tcp != null {
+            set s = this.tcp ?? init TcpStream(0)
+            return s.read(max_len)
+        }
+        return ""
+    }
+
+    public fun read_bytes(buf: ptr<uint8>, max_len: int64) -> int64 {
+        if this.is_closed { return 0 }
+        if this.tls != null {
+            set s = this.tls ?? init TlsStream(0)
+            return s.read_bytes(buf, max_len)
+        }
+        if this.tcp != null {
+            set s = this.tcp ?? init TcpStream(0)
+            return s.read_bytes(buf, max_len)
+        }
+        return 0
+    }
+
+    public fun write(data: string) -> int64 {
+        if this.is_closed { return 0 }
+        if this.tls != null {
+            set s = this.tls ?? init TlsStream(0)
+            return s.write(data)
+        }
+        if this.tcp != null {
+            set s = this.tcp ?? init TcpStream(0)
+            return s.write(data)
+        }
+        return 0
+    }
+
+    public fun write_bytes(buf: ptr<uint8>, len: int64) -> int64 {
+        if this.is_closed { return 0 }
+        if this.tls != null {
+            set s = this.tls ?? init TlsStream(0)
+            return s.write_bytes(buf, len)
+        }
+        if this.tcp != null {
+            set s = this.tcp ?? init TcpStream(0)
+            return s.write_bytes(buf, len)
+        }
+        return 0
+    }
+
+    public fun flush() -> bool {
+        if this.is_closed { return false }
+        if this.tls != null {
+            set s = this.tls ?? init TlsStream(0)
+            return s.flush()
+        }
+        if this.tcp != null {
+            set s = this.tcp ?? init TcpStream(0)
+            return s.flush()
+        }
+        return true
+    }
+
+    public fun close() -> bool {
+        if this.is_closed { return true }
+        rewrite this.is_closed = true
+        set ok = true
+        if this.tls != null {
+            set s = this.tls ?? init TlsStream(0)
+            rewrite ok = s.close() && ok
+        }
+        if this.tcp != null {
+            set s = this.tcp ?? init TcpStream(0)
+            rewrite ok = s.close() && ok
+        }
+        return ok
+    }
+
+    public fun set_timeouts(read_ms: int64, write_ms: int64) {
+        if this.tcp != null {
+            set s = this.tcp ?? init TcpStream(0)
+            s.set_timeouts(read_ms, write_ms)
+        }
+    }
+}
+
+public fun stream_from_tcp(stream: TcpStream) -> ConnectionStream {
+    set cs = init ConnectionStream()
+    cs.init_tcp(stream)
+    return cs
+}
+
+public fun stream_from_tls(tls: TlsStream) -> ConnectionStream {
+    set cs = init ConnectionStream()
+    cs.init_tls(tls)
+    return cs
+}
+
+public fun stream_from_tls_tcp(tls: TlsStream, tcp: TcpStream) -> ConnectionStream {
+    set cs = init ConnectionStream()
+    cs.init_tls_with_tcp(tls, tcp)
+    return cs
+}
+
+public fun stream_noop() -> ConnectionStream {
+    set cs = init ConnectionStream()
+    return cs
+}

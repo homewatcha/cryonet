@@ -1,0 +1,21 @@
+load std.datetime: steady_nanos
+load ..context: Context
+load ..response: Response, response_new
+load .pipeline: MiddlewareFn, NextFn
+
+// post-execution duration check: replaces response with 504 if execution exceeded max_ms
+public fun latency_guard_middleware(max_ms: int64) -> MiddlewareFn {
+    return fun(ctx: Context, next: NextFn) => {
+        set start_time = steady_nanos() / 1000000
+        set resp = next(ctx)
+        set elapsed = (steady_nanos() / 1000000) - start_time
+        if elapsed > max_ms {
+            return response_new(504, "504 Gateway Timeout")
+        }
+        return resp
+    }
+}
+
+public fun timeout_middleware(max_ms: int64) -> MiddlewareFn {
+    return latency_guard_middleware(max_ms)
+}

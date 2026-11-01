@@ -1,0 +1,16 @@
+load std.random: rand_uuid_v4
+load ..context: Context
+load ..response: Response
+
+public fun request_id_middleware(ctx: Context, next: fun(Context) -> Response) -> Response {
+    set incoming = ctx.header("X-Request-Id")
+    set req_id: string = if incoming != null && (incoming ?? "").len() > 0 {
+        incoming ?? ""
+    } else {
+        rand_uuid_v4()
+    }
+    ctx.set_state("request_id", req_id)
+    set resp = next(ctx)
+    resp.header("X-Request-Id", req_id)
+    return resp
+}

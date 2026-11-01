@@ -1,0 +1,308 @@
+load std.strings: lower, trim, index_of
+load std.net.tcp: TcpStream
+load std.net.tls: TlsStream
+load ..request: Request
+load ..response: Response, response_new
+load .crypto: sha1, base64_encode
+load .stream: ConnectionStream, stream_from_tcp, stream_from_tls, stream_from_tls_tcp
+
+static WS_GUID: string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+public struct WsFrame {
+    fin: bool
+    opcode: int32
+    payload: bytes
+}
+
+public struct WsMessage {
+    opcode: int32
+    text_payload: string
+    binary_payload: bytes
+    is_text: bool
+    is_close: bool
+    is_ping: bool
+    is_pong: bool
+}
+
+public fun is_websocket_request(ref req: Request) -> bool {
+    set up = req.header("Upgrade")
+    set conn = req.header("Connection")
+    set key = req.header("Sec-WebSocket-Key")
+    if up == null || conn == null || key == null { return false }
+    set up_low = lower(trim(up ?? ""))
+    set conn_low = lower(trim(conn ?? ""))
+    return up_low == "websocket" && (index_of(conn_low, "upgrade") ?? -1) >= 0
+}
+
+public fun websocket_accept_key(client_key: string) -> string {
+    set combined = "${client_key}${WS_GUID}"
+    set digest = sha1(combined)
+    return base64_encode(digest)
+}
+
+public fun websocket_upgrade_response(client_key: string) -> Response {
+    set accept = websocket_accept_key(client_key)
+    set resp = response_new(101, "")
+    resp.header("Upgrade", "websocket")
+    resp.header("Connection", "Upgrade")
+    resp.header("Sec-WebSocket-Accept", accept)
+    return resp
+}
+
+public fun websocket_upgrade(ref req: Request) -> Response {
+    set key = req.header("Sec-WebSocket-Key") ?? ""
+    return websocket_upgrade_response(key)
+}
+
+public fun websocket_session_from_tcp(stream: TcpStream, timeout_ms: int64 = 0) -> WebSocketSession {
+    return init WebSocketSession(stream_from_tcp(stream), timeout_ms)
+}
+
+public fun websocket_session_from_tls(tls: TlsStream, timeout_ms: int64 = 0, stream: TcpStream? = null) -> WebSocketSession {
+    if stream != null {
+        set s = stream ?? init TcpStream(0)
+        return init WebSocketSession(stream_from_tls_tcp(tls, s), timeout_ms)
+    }
+    return init WebSocketSession(stream_from_tls(tls), timeout_ms)
+}
+
+public class WebSocketSession {
+    stream: ConnectionStream
+    in_fragment: bool
+    frag_opcode: int32
+    frag_payload: string
+
+    public fun init(stream: ConnectionStream, timeout_ms: int64 = 0) {
+        rewrite this.stream = stream
+        rewrite this.in_fragment = false
+        rewrite this.frag_opcode = 0
+        rewrite this.frag_payload = ""
+        this.stream.set_timeouts(timeout_ms, timeout_ms)
+    }
+
+    public fun set_timeout_ms(timeout_ms: int64) {
+        this.stream.set_timeouts(timeout_ms, timeout_ms)
+    }
+
+    public fun set_timeouts(read_ms: int64, write_ms: int64) {
+        this.stream.set_timeouts(read_ms, write_ms)
+    }
+
+    public fun send_text(text: string) -> bool {
+        set data: bytes = cast(text, "bytes")
+        return this.send_frame(1, data, true)
+    }
+
+    public fun send_binary(data: bytes) -> bool {
+        return this.send_frame(2, data, true)
+    }
+
+    public fun send_ping(data: string = "") -> bool {
+        return this.send_frame(9, cast(data, "bytes"), true)
+    }
+
+    public fun send_pong(data: string = "") -> bool {
+        return this.send_frame(10, cast(data, "bytes"), true)
+    }
+
+    public fun close(code: int32 = 1000) -> bool {
+        set b0: uint8 = cast((code >> 8) & 0xFF, "uint8")
+        set b1: uint8 = cast(code & 0xFF, "uint8")
+        set ch0 = cast(b0, "char")
+        set ch1 = cast(b1, "char")
+        set payload_str = "${ch0}${ch1}"
+        set ok = this.send_frame(8, cast(payload_str, "bytes"), true)
+        this.stream.close()
+        return ok
+    }
+
+    public fun send_frame(opcode: int32, payload: bytes, fin: bool = true) -> bool {
+        set len = payload.len()
+        set head_bytes: uint8[] = []
+        set fin_flag: int32 = cast(if fin { 0x80 } else { 0 }, "int32")
+        set b0: uint8 = cast(fin_flag | (opcode & 0x0F), "uint8")
+        head_bytes.push(b0)
+
+        if len < 126 {
+            head_bytes.push(cast(len, "uint8"))
+        } else {
+            if len <= 65535 {
+                head_bytes.push(126u8)
+                head_bytes.push(cast((len >> 8) & 0xFF, "uint8"))
+                head_bytes.push(cast(len & 0xFF, "uint8"))
+            } else {
+                head_bytes.push(127u8)
+                for i in 0..8 {
+                    set shift = (7 - i) * 8
+                    head_bytes.push(cast((len >> shift) & 0xFF, "uint8"))
+                }
+            }
+        }
+
+        set head_str = ""
+        for i in 0..head_bytes.len() {
+            set ch = cast(head_bytes[i], "char")
+            rewrite head_str = "${head_str}${ch}"
+        }
+
+        set ok = true
+        sus {
+            this.stream.write(head_str)
+            if len > 0 {
+                this.stream.write_bytes(payload.as_ptr(), len)
+            }
+            this.stream.flush()
+        } catch {
+            rewrite ok = false
+        }
+        return ok
+    }
+
+    public fun read_frame() -> WsFrame? {
+        set header_chunk = this.stream.read(2)
+        if header_chunk.len() < 2 { return null }
+
+        set b0: uint8 = cast(header_chunk[0], "uint8")
+        set b1: uint8 = cast(header_chunk[1], "uint8")
+
+        set fin = (b0 & 0x80u8) != 0u8
+        set opcode: int32 = cast(b0 & 0x0Fu8, "int32")
+        set is_masked = (b1 & 0x80u8) != 0u8
+        set raw_len: int64 = cast(b1 & 0x7Fu8, "int64")
+
+        set payload_len: int64 = raw_len
+        if raw_len == 126 {
+            set ext = this.stream.read(2)
+            if ext.len() < 2 { return null }
+            set e0: int64 = cast(cast(ext[0], "uint8"), "int64")
+            set e1: int64 = cast(cast(ext[1], "uint8"), "int64")
+            rewrite payload_len = (e0 << 8) | e1
+        } else {
+            if raw_len == 127 {
+                set ext = this.stream.read(8)
+                if ext.len() < 8 { return null }
+                set acc: int64 = 0
+                for i in 0..8 {
+                    set eb: int64 = cast(cast(ext[i], "uint8"), "int64")
+                    rewrite acc = (acc << 8) | eb
+                }
+                rewrite payload_len = acc
+            }
+        }
+
+        set mask: uint8[] = []
+        if is_masked {
+            set m = this.stream.read(4)
+            if m.len() < 4 { return null }
+            for i in 0..4 {
+                mask.push(cast(m[i], "uint8"))
+            }
+        }
+
+        set raw_payload = ""
+        while raw_payload.len() < payload_len {
+            set need = payload_len - raw_payload.len()
+            set chunk = this.stream.read(need)
+            if chunk.len() == 0 { break }
+            rewrite raw_payload = "${raw_payload}${chunk}"
+        }
+
+        set out_str = ""
+        if is_masked {
+            for i in 0..raw_payload.len() {
+                set b: uint8 = cast(raw_payload[i], "uint8")
+                set m_byte = mask[i % 4]
+                set unmasked: uint8 = b ^ m_byte
+                set ch = cast(unmasked, "char")
+                rewrite out_str = "${out_str}${ch}"
+            }
+        } else {
+            rewrite out_str = raw_payload
+        }
+
+        set out_bytes: bytes = cast(out_str, "bytes")
+        return WsFrame {
+            fin: fin,
+            opcode: opcode,
+            payload: out_bytes
+        }
+    }
+
+    public fun recv_message(auto_pong: bool = true) -> WsMessage? {
+        while true {
+            set f = this.read_frame()
+            if f == null { return null }
+            set frame = f ?? WsFrame { fin: true, opcode: 0, payload: cast("", "bytes") }
+
+            // RFC 6455: Control frames (opcode >= 8) may be interleaved within fragmented messages
+            if frame.opcode >= 8 {
+                if frame.opcode == 9 && auto_pong {
+                    this.send_pong(cast(frame.payload, "string"))
+                }
+                set payload_str = cast(frame.payload, "string")
+                return WsMessage {
+                    opcode: frame.opcode,
+                    text_payload: payload_str,
+                    binary_payload: frame.payload,
+                    is_text: false,
+                    is_close: frame.opcode == 8,
+                    is_ping: frame.opcode == 9,
+                    is_pong: frame.opcode == 10
+                }
+            }
+
+            if !this.in_fragment {
+                if frame.fin {
+                    // Single-frame complete message
+                    set is_txt = frame.opcode == 1
+                    set payload_str = cast(frame.payload, "string")
+                    return WsMessage {
+                        opcode: frame.opcode,
+                        text_payload: if is_txt { payload_str } else { "" },
+                        binary_payload: frame.payload,
+                        is_text: is_txt,
+                        is_close: false,
+                        is_ping: false,
+                        is_pong: false
+                    }
+                } else {
+                    // First fragment of a multi-frame message
+                    rewrite this.in_fragment = true
+                    rewrite this.frag_opcode = frame.opcode
+                    rewrite this.frag_payload = cast(frame.payload, "string")
+                }
+            } else {
+                // Continuation fragment (opcode == 0)
+                set chunk_str = cast(frame.payload, "string")
+                rewrite this.frag_payload = "${this.frag_payload}${chunk_str}"
+
+                if frame.fin {
+                    // Final fragment received, reassembly complete
+                    set full_str: string = this.frag_payload
+                    set full_bytes: bytes = cast(full_str, "bytes")
+                    set orig_opcode: int32 = this.frag_opcode
+                    set is_txt = orig_opcode == 1
+
+                    rewrite this.in_fragment = false
+                    rewrite this.frag_opcode = 0
+                    rewrite this.frag_payload = ""
+
+                    return WsMessage {
+                        opcode: orig_opcode,
+                        text_payload: if is_txt { full_str } else { "" },
+                        binary_payload: full_bytes,
+                        is_text: is_txt,
+                        is_close: false,
+                        is_ping: false,
+                        is_pong: false
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    public fun recv() -> WsMessage? {
+        return this.recv_message(true)
+    }
+}
