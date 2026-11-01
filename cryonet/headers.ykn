@@ -1,0 +1,96 @@
+load std.strings: slice, index_of, trim, starts_with, split
+load std.numf: parse_base
+load .realtime.crypto: base64_decode
+
+public struct BasicAuth {
+    username: string
+    password: string
+}
+
+public struct HttpRange {
+    start: int64
+    end: int64
+    satisfiable: bool
+}
+
+public fun parse_basic_auth(auth_header: string) -> BasicAuth? {
+    set h = trim(auth_header)
+    if !(starts_with(h, "Basic ") ?? false) && !(starts_with(h, "basic ") ?? false) {
+        return null
+    }
+    set b64 = trim(slice(h, 6, h.len()))
+    set decoded_bytes = base64_decode(b64)
+    if decoded_bytes == null { return null }
+    set plain = cast(decoded_bytes ?? cast("", "bytes"), "string")
+    set colon_pos = index_of(plain, ":")
+    if colon_pos == null {
+        return BasicAuth { username: plain, password: "" }
+    }
+    set c_idx = colon_pos ?? 0
+    set u = slice(plain, 0, c_idx)
+    set p = slice(plain, c_idx + 1, plain.len())
+    return BasicAuth { username: u, password: p }
+}
+
+public fun parse_bearer_token(auth_header: string) -> string? {
+    set h = trim(auth_header)
+    if (starts_with(h, "Bearer ") ?? false) || (starts_with(h, "bearer ") ?? false) {
+        return trim(slice(h, 7, h.len()))
+    }
+    return null
+}
+
+public fun parse_range_header(range_header: string, total_len: int64) -> HttpRange? {
+    set h = trim(range_header)
+    if !(starts_with(h, "bytes=") ?? false) { return null }
+    set range_spec = slice(h, 6, h.len())
+    set dash_pos = index_of(range_spec, "-")
+    if dash_pos == null { return null }
+    set d_idx = dash_pos ?? 0
+
+    set start_str = trim(slice(range_spec, 0, d_idx))
+    set end_str = trim(slice(range_spec, d_idx + 1, range_spec.len()))
+
+    if start_str.len() == 0 && end_str.len() == 0 {
+        return null
+    }
+
+    if start_str.len() == 0 {
+        set p_end = parse_base(end_str, 10)
+        if p_end == null { return null }
+        set suffix_len = p_end ?? 0
+        if suffix_len <= 0 { return null }
+        if total_len <= 0 {
+            return HttpRange { start: 0, end: 0, satisfiable: false }
+        }
+        if suffix_len > total_len { rewrite suffix_len = total_len }
+        set start_val = total_len - suffix_len
+        set end_val = total_len - 1
+        return HttpRange { start: start_val, end: end_val, satisfiable: true }
+    }
+
+    set p_start = parse_base(start_str, 10)
+    if p_start == null { return null }
+    set start_val = p_start ?? 0
+    if start_val < 0 { return null }
+
+    if end_str.len() > 0 {
+        set p_end = parse_base(end_str, 10)
+        if p_end == null { return null }
+        set end_val = p_end ?? 0
+        if end_val < 0 { return null }
+
+        if start_val > end_val || start_val >= total_len || total_len <= 0 {
+            return HttpRange { start: start_val, end: end_val, satisfiable: false }
+        }
+
+        if end_val >= total_len { rewrite end_val = total_len - 1 }
+        return HttpRange { start: start_val, end: end_val, satisfiable: true }
+    }
+
+    if start_val >= total_len || total_len <= 0 {
+        return HttpRange { start: start_val, end: total_len - 1, satisfiable: false }
+    }
+    set end_val = total_len - 1
+    return HttpRange { start: start_val, end: end_val, satisfiable: true }
+}

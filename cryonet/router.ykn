@@ -1,0 +1,437 @@
+load std.strings: split, trim, starts_with, ends_with, slice, index_of
+load std.net.tcp: TcpStream
+load std.net.tls: TlsStream
+load .request: Request, RouteParam
+load .response: Response, response_new, response_text, response_not_found, response_server_error
+load .context: Context, AnyState, AppState, ContextError
+load .method: MethodRouter, HandlerFn
+load .middleware.pipeline: MiddlewareFn, execute_pipeline
+
+public fun clean_path(path: string) -> string {
+    set q_mark = index_of(path, "?")
+    set raw: string = if q_mark != null { slice(path, 0, q_mark ?? 0) } else { path }
+    set trimmed = trim(raw)
+    if trimmed.len() == 0 { return "/" }
+    set res: string = if starts_with(trimmed, "/") ?? false { trimmed } else { "/${trimmed}" }
+    while res.len() > 1 && (ends_with(res, "/") ?? false) {
+        rewrite res = slice(res, 0, res.len() - 1)
+    }
+    return res
+}
+
+public fun split_path(path: string) -> string[] {
+    set res: string[] = []
+    set parts = split(path, "/")
+    for i in 0..parts.len() {
+        set p = trim(parts[i])
+        if p.len() > 0 {
+            res.push(p)
+        }
+    }
+    return res
+}
+
+public fun path_matches_prefix(path: string, prefix: string) -> bool {
+    if prefix == "/" || prefix == "" { return true }
+    if path == prefix { return true }
+    return starts_with(path, "${prefix}/") ?? false
+}
+
+fun default_not_found_resp(c: Context) -> Response {
+    return response_not_found("404 Not Found")
+}
+
+public class Route {
+    pattern: string
+    segments: string[]
+    is_wildcard: bool
+    wildcard_name: string
+    priority_score: int32
+    method_router: MethodRouter
+
+    public fun init(pattern: string, method_router: MethodRouter) {
+        rewrite this.pattern = clean_path(pattern)
+        rewrite this.method_router = method_router
+        rewrite this.segments = split_path(this.pattern)
+        rewrite this.is_wildcard = false
+        rewrite this.wildcard_name = ""
+        rewrite this.priority_score = 0
+
+        set score: int32 = 0
+        for i in 0..this.segments.len() {
+            set s: string = this.segments[i]
+            if starts_with(s, "*") ?? false {
+                rewrite this.is_wildcard = true
+                rewrite this.wildcard_name = if s.len() > 1 { slice(s, 1, s.len()) } else { "path" }
+                rewrite score += 1
+            } else {
+                if starts_with(s, ":") ?? false {
+                    rewrite score += 100
+                } else {
+                    if (starts_with(s, "{") ?? false) && (ends_with(s, "}") ?? false) {
+                        rewrite score += 100
+                    } else {
+                        rewrite score += 1000
+                    }
+                }
+            }
+        }
+        rewrite this.priority_score = score
+    }
+
+    public fun matches(path: string, ref out_params: RouteParam[]) -> bool {
+        set req_segs = split_path(path)
+
+        if !this.is_wildcard {
+            if req_segs.len() != this.segments.len() { return false }
+            for i in 0..this.segments.len() {
+                set seg: string = this.segments[i]
+                set req_seg = req_segs[i]
+                if starts_with(seg, ":") ?? false {
+                    set param_name = slice(seg, 1, seg.len())
+                    out_params.push(RouteParam { name: param_name, value: req_seg })
+                } else {
+                    if (starts_with(seg, "{") ?? false) && (ends_with(seg, "}") ?? false) {
+                        set param_name = slice(seg, 1, seg.len() - 1)
+                        out_params.push(RouteParam { name: param_name, value: req_seg })
+                    } else {
+                        if seg != req_seg { return false }
+                    }
+                }
+            }
+            return true
+        }
+
+        set n = this.segments.len()
+        set prefix_count = n - 1
+        if req_segs.len() < prefix_count { return false }
+
+        for i in 0..prefix_count {
+            set seg: string = this.segments[i]
+            set req_seg = req_segs[i]
+            if starts_with(seg, ":") ?? false {
+                set param_name = slice(seg, 1, seg.len())
+                out_params.push(RouteParam { name: param_name, value: req_seg })
+            } else {
+                if (starts_with(seg, "{") ?? false) && (ends_with(seg, "}") ?? false) {
+                    set param_name = slice(seg, 1, seg.len() - 1)
+                    out_params.push(RouteParam { name: param_name, value: req_seg })
+                } else {
+                    if seg != req_seg { return false }
+                }
+            }
+        }
+
+        set tail_val = ""
+        for j in prefix_count..req_segs.len() {
+            if j > prefix_count { rewrite tail_val = "${tail_val}/" }
+            rewrite tail_val = "${tail_val}${req_segs[j]}"
+        }
+        out_params.push(RouteParam { name: this.wildcard_name, value: tail_val })
+        return true
+    }
+
+    public fun handle(ctx: Context) -> Response? {
+        return this.method_router.handle(ctx)
+    }
+}
+
+public struct SubFallback {
+    prefix: string
+    middlewares: MiddlewareFn[]
+    handler: HandlerFn
+}
+
+public class Router {
+    routes: Route[]
+    middlewares: MiddlewareFn[]
+    route_middlewares: MiddlewareFn[]
+    fallback_handler: HandlerFn?
+    app_state: AppState?
+    sub_fallbacks: SubFallback[]
+
+    public fun init() {
+        rewrite this.routes = []
+        rewrite this.middlewares = []
+        rewrite this.route_middlewares = []
+        rewrite this.fallback_handler = null
+        rewrite this.app_state = null
+        rewrite this.sub_fallbacks = []
+    }
+
+    public fun with_state(state: AppState) -> Router {
+        rewrite this.app_state = state
+        return this
+    }
+
+    public fun route(path: string, method_router: MethodRouter) -> Router {
+        set r = init Route(path, method_router)
+        return this.add_route_obj(r)
+    }
+
+    public fun route_layer(mw: MiddlewareFn) -> Router {
+        this.route_middlewares.push(mw)
+        return this
+    }
+
+    public fun add_route_obj(r: Route) -> Router {
+        set insert_idx: int64 = -1
+        for i in 0..this.routes.len() {
+            if r.priority_score > this.routes[i].priority_score {
+                rewrite insert_idx = i
+                break
+            }
+        }
+        set new_routes: Route[] = []
+        if insert_idx < 0 {
+            for i in 0..this.routes.len() {
+                new_routes.push(this.routes[i])
+            }
+            new_routes.push(r)
+        } else {
+            for i in 0..insert_idx {
+                new_routes.push(this.routes[i])
+            }
+            new_routes.push(r)
+            for i in insert_idx..this.routes.len() {
+                new_routes.push(this.routes[i])
+            }
+        }
+        rewrite this.routes = new_routes
+        return this
+    }
+
+    public fun nest(prefix: string, sub_router: Router) -> Router {
+        set clean_pref = clean_path(prefix)
+        for i in 0..sub_router.routes.len() {
+            set sub_route: Route = sub_router.routes[i]
+            set full_path: string = if sub_route.pattern == "/" {
+                clean_pref
+            } else {
+                "${clean_pref}${sub_route.pattern}"
+            }
+
+            set new_mr = sub_route.method_router.clone()
+            set composed_sub_mw: MiddlewareFn[] = []
+            for m in 0..sub_router.middlewares.len() {
+                composed_sub_mw.push(sub_router.middlewares[m])
+            }
+            for m in 0..sub_router.route_middlewares.len() {
+                composed_sub_mw.push(sub_router.route_middlewares[m])
+            }
+            for m in 0..new_mr.route_middlewares.len() {
+                composed_sub_mw.push(new_mr.route_middlewares[m])
+            }
+            rewrite new_mr.route_middlewares = composed_sub_mw
+
+            set new_r = init Route(full_path, new_mr)
+            this.add_route_obj(new_r)
+        }
+
+        if sub_router.fallback_handler != null {
+            set fb = sub_router.fallback_handler ?? default_not_found_resp
+            this.sub_fallbacks.push(SubFallback {
+                prefix: clean_pref,
+                middlewares: sub_router.middlewares,
+                handler: fb
+            })
+        }
+
+        for sf in 0..sub_router.sub_fallbacks.len() {
+            set orig_sf: SubFallback = sub_router.sub_fallbacks[sf]
+            set nested_prefix = "${clean_pref}${orig_sf.prefix}"
+            set composed_mw: MiddlewareFn[] = []
+            for m in 0..sub_router.middlewares.len() { composed_mw.push(sub_router.middlewares[m]) }
+            for m in 0..orig_sf.middlewares.len() { composed_mw.push(orig_sf.middlewares[m]) }
+            this.sub_fallbacks.push(SubFallback {
+                prefix: nested_prefix,
+                middlewares: composed_mw,
+                handler: orig_sf.handler
+            })
+        }
+
+        return this
+    }
+
+    public fun merge(other: Router) -> Router {
+        for i in 0..other.routes.len() {
+            set sub_route: Route = other.routes[i]
+            set new_mr = sub_route.method_router.clone()
+            set composed_mw: MiddlewareFn[] = []
+            for m in 0..other.middlewares.len() {
+                composed_mw.push(other.middlewares[m])
+            }
+            for m in 0..other.route_middlewares.len() {
+                composed_mw.push(other.route_middlewares[m])
+            }
+            for m in 0..new_mr.route_middlewares.len() {
+                composed_mw.push(new_mr.route_middlewares[m])
+            }
+            rewrite new_mr.route_middlewares = composed_mw
+            set new_r = init Route(sub_route.pattern, new_mr)
+            this.add_route_obj(new_r)
+        }
+        for sf in 0..other.sub_fallbacks.len() {
+            set orig_sf: SubFallback = other.sub_fallbacks[sf]
+            set composed_mw: MiddlewareFn[] = []
+            for m in 0..other.middlewares.len() { composed_mw.push(other.middlewares[m]) }
+            for m in 0..orig_sf.middlewares.len() { composed_mw.push(orig_sf.middlewares[m]) }
+            this.sub_fallbacks.push(SubFallback {
+                prefix: orig_sf.prefix,
+                middlewares: composed_mw,
+                handler: orig_sf.handler
+            })
+        }
+        if this.fallback_handler == null && other.fallback_handler != null {
+            set fb: HandlerFn = other.fallback_handler ?? default_not_found_resp
+            if other.middlewares.len() > 0 {
+                set orig_fb: HandlerFn = fb
+                set mws: MiddlewareFn[] = other.middlewares
+                rewrite this.fallback_handler = fun(c: Context) => execute_pipeline(c, mws, orig_fb)
+            } else {
+                rewrite this.fallback_handler = fb
+            }
+        }
+        return this
+    }
+
+    public fun fallback(handler: HandlerFn) -> Router {
+        rewrite this.fallback_handler = handler
+        return this
+    }
+
+    public fun layer(mw: MiddlewareFn) -> Router {
+        this.middlewares.push(mw)
+        return this
+    }
+
+    public fun match_and_handle(ctx: Context) -> Response {
+        set req_path = clean_path(ctx.path())
+        set matched_any_path = false
+        set all_allowed_methods: string[] = []
+        set matched_route_idx: int64 = -1
+
+        for i in 0..this.routes.len() {
+            set r: Route = this.routes[i]
+            set check_params: RouteParam[] = []
+            if r.matches(req_path, ref check_params) {
+                rewrite matched_any_path = true
+                set allowed = r.method_router.allowed_methods()
+                for m in 0..allowed.len() {
+                    set meth = allowed[m]
+                    set exists = false
+                    for a in 0..all_allowed_methods.len() {
+                        if all_allowed_methods[a] == meth {
+                            rewrite exists = true
+                            break
+                        }
+                    }
+                    if !exists { all_allowed_methods.push(meth) }
+                }
+
+                if r.method_router.supports_method(ctx.method()) {
+                    rewrite matched_route_idx = i
+                    break
+                }
+            }
+        }
+
+        if matched_route_idx >= 0 {
+            set matched_r: Route = this.routes[matched_route_idx]
+            rewrite ctx.req.matched_path = matched_r.pattern
+            set final_params: RouteParam[] = []
+            matched_r.matches(req_path, ref final_params)
+            for p in 0..final_params.len() {
+                ctx.req.set_param(final_params[p].name, final_params[p].value)
+            }
+
+            if this.route_middlewares.len() > 0 {
+                return execute_pipeline(ctx, this.route_middlewares, fun(c: Context) => matched_r.handle(c) ?? response_new(200, ""))
+            }
+            set resp = matched_r.handle(ctx)
+            return resp ?? response_new(200, "")
+        }
+
+        if matched_any_path {
+            if ctx.method() == "OPTIONS" {
+                set r_opt = response_new(204, "")
+                set allow_str = ""
+                for a in 0..all_allowed_methods.len() {
+                    if a > 0 { rewrite allow_str = "${allow_str}, " }
+                    rewrite allow_str = "${allow_str}${all_allowed_methods[a]}"
+                }
+                r_opt.header("Allow", allow_str)
+                return r_opt
+            }
+            set r_405 = response_text("Method Not Allowed", 405)
+            set allow_str = ""
+            for a in 0..all_allowed_methods.len() {
+                if a > 0 { rewrite allow_str = "${allow_str}, " }
+                rewrite allow_str = "${allow_str}${all_allowed_methods[a]}"
+            }
+            r_405.header("Allow", allow_str)
+            return r_405
+        }
+
+        set matched_sf_idx: int64 = -1
+        set longest_prefix_len: int64 = -1
+        for sf in 0..this.sub_fallbacks.len() {
+            set cur_sf: SubFallback = this.sub_fallbacks[sf]
+            if path_matches_prefix(req_path, cur_sf.prefix) {
+                if cur_sf.prefix.len() > longest_prefix_len {
+                    rewrite longest_prefix_len = cur_sf.prefix.len()
+                    rewrite matched_sf_idx = sf
+                }
+            }
+        }
+
+        if matched_sf_idx >= 0 {
+            set item: SubFallback = this.sub_fallbacks[matched_sf_idx]
+            set fb: HandlerFn = item.handler
+            if item.middlewares.len() > 0 {
+                return execute_pipeline(ctx, item.middlewares, fb)
+            }
+            return fb(ctx)
+        }
+
+        if this.fallback_handler != null {
+            set fb: HandlerFn = this.fallback_handler ?? default_not_found_resp
+            return fb(ctx)
+        }
+
+        return response_not_found("404 Not Found")
+    }
+
+    fun dispatch_full(req: Request, stream: TcpStream?, tls_stream: TlsStream?) -> Response {
+        set r_router = this
+        set base_dispatch = fun(ctx: Context) => r_router.match_and_handle(ctx)
+        set initial_ctx = init Context(req, this.app_state, stream, tls_stream)
+        set resp: Response? = null
+        sus {
+            rewrite resp = execute_pipeline(initial_ctx, this.middlewares, base_dispatch)
+        } catch err: ContextError {
+            set status_code: int32 = cast(400, "int32")
+            if err.code > 0 {
+                rewrite status_code = err.code
+            }
+            return response_text(err.message, status_code)
+        }
+        return resp ?? response_server_error("Internal Server Error")
+    }
+
+    public fun dispatch_with_stream(req: Request, stream: TcpStream? = null) -> Response {
+        return this.dispatch_full(req, stream, null)
+    }
+
+    public fun dispatch_with_tls_stream(req: Request, tls_stream: TlsStream, stream: TcpStream? = null) -> Response {
+        return this.dispatch_full(req, stream, tls_stream)
+    }
+
+    public fun dispatch(req: Request) -> Response {
+        return this.dispatch_full(req, null, null)
+    }
+}
+
+public fun router() -> Router {
+    return init Router()
+}

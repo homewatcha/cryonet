@@ -1,0 +1,391 @@
+load std.net.tcp: TcpListener, TcpStream, tcp_listen
+load std.net.tls: TlsStream, TlsServerConfig, tls_accept
+load std.net.errors: NetError, HttpError
+load std.net.http_types: HttpRequest, HttpHeaders, status_reason
+load std.net.http_codec: parse_request_with_limit, parse_tls_request_with_limit
+load std.strings: lower, trim, starts_with
+load std.threads: sleep
+load std.sync: AtomicBool, AtomicInt64, atomic_bool, atomic_i64
+load .request: Request
+load .response: Response, response_bad_request, response_payload_too_large
+load .context: ContextError
+load .router: Router
+
+fun is_binary_content_type(ct: string) -> bool {
+    set low = lower(ct)
+    if starts_with(low, "image/") ?? false { return true }
+    if starts_with(low, "audio/") ?? false { return true }
+    if starts_with(low, "video/") ?? false { return true }
+    if starts_with(low, "application/octet-stream") ?? false { return true }
+    if starts_with(low, "application/wasm") ?? false { return true }
+    if starts_with(low, "application/pdf") ?? false { return true }
+    if starts_with(low, "application/zip") ?? false { return true }
+    if starts_with(low, "multipart/form-data") ?? false { return true }
+    return false
+}
+
+public fun request_from_http(ref raw: HttpRequest, client_addr: string = "127.0.0.1:0") -> Request {
+    set b: bytes = cast(raw.body, "bytes")
+    set ct = raw.headers.get("Content-Type") ?? ""
+    set is_bin = is_binary_content_type(ct)
+    return init Request(
+        raw.method,
+        raw.path,
+        raw.path,
+        raw.headers,
+        raw.body,
+        b,
+        is_bin,
+        raw.query,
+        [],
+        client_addr,
+        raw.path,
+        raw.path
+    )
+}
+
+public class Server {
+    addr: string
+    router: Router
+    listener: TcpListener?
+    is_running: AtomicBool
+    active_conns: AtomicInt64
+    timeout_ms: int64
+    max_body_size: int64
+    cert_pem: string
+    key_pem: string
+    use_tls: bool
+
+    public fun init(
+        addr: string,
+        router: Router,
+        timeout_ms: int64 = 10000,
+        max_body_size: int64 = 2097152
+    ) {
+        rewrite this.addr = addr
+        rewrite this.router = router
+        rewrite this.listener = null
+        rewrite this.is_running = atomic_bool(false)
+        rewrite this.active_conns = atomic_i64(0)
+        rewrite this.timeout_ms = timeout_ms
+        rewrite this.max_body_size = max_body_size
+        rewrite this.cert_pem = ""
+        rewrite this.key_pem = ""
+        rewrite this.use_tls = false
+    }
+
+    public fun enable_tls(cert_pem: string, key_pem: string) -> Server {
+        rewrite this.cert_pem = cert_pem
+        rewrite this.key_pem = key_pem
+        rewrite this.use_tls = true
+        return this
+    }
+
+    public fun handle_connection(stream: TcpStream) {
+        this.active_conns.fetch_add(1)
+        stream.set_timeouts(this.timeout_ms, this.timeout_ms)
+        stream.set_nodelay(true)
+        set client_addr = stream.peer_addr()
+
+        while this.is_running.get() {
+            set req: HttpRequest? = null
+            set parse_failed = false
+            set too_large = false
+
+            sus {
+                rewrite req = parse_request_with_limit(ref stream, this.max_body_size)
+            } catch err: HttpError {
+                if err.code == 413 {
+                    rewrite too_large = true
+                } else {
+                    rewrite parse_failed = true
+                }
+            } catch {
+                rewrite parse_failed = true
+            }
+
+            if req != null {
+                set raw = req ?? init HttpRequest("GET", "/", init HttpHeaders(), "", [])
+                if raw.body.len() > this.max_body_size {
+                    rewrite too_large = true
+                }
+            }
+
+            if too_large {
+                set resp_413 = response_payload_too_large("413 Payload Too Large")
+                this.send_response_tcp(ref stream, resp_413, false)
+                break
+            }
+
+            if parse_failed {
+                set bad_resp = response_bad_request("400 Bad Request")
+                this.send_response_tcp(ref stream, bad_resp, false)
+                break
+            }
+
+            if req == null { break }
+            set raw_req = req ?? init HttpRequest("GET", "/", init HttpHeaders(), "", [])
+
+            set cryo_req = request_from_http(ref raw_req, client_addr)
+            set cryo_resp: Response? = null
+            sus {
+                rewrite cryo_resp = this.router.dispatch_with_stream(cryo_req, stream)
+            } catch err: ContextError {
+                set status_code: int32 = cast(400, "int32")
+                if err.code > 0 {
+                    rewrite status_code = err.code
+                }
+                rewrite cryo_resp = response_bad_request(err.message).status_code(status_code)
+            } catch {
+                set err_headers = init HttpHeaders()
+                err_headers.set("Content-Type", "text/plain; charset=utf-8")
+                rewrite cryo_resp = init Response(500, err_headers, "Internal Server Error", null, false)
+            }
+
+            set resp_val = cryo_resp ?? init Response(500, null, "Internal Server Error", null, false)
+            if resp_val.is_hijacked {
+                break
+            }
+
+            set is_head_req = raw_req.method == "HEAD"
+            set send_ok = this.send_response_tcp(ref stream, resp_val, is_head_req)
+            if !send_ok { break }
+
+            set conn_hdr = raw_req.headers.get("Connection")
+            if conn_hdr != null && lower(trim(conn_hdr ?? "")) == "close" {
+                break
+            }
+        }
+
+        stream.close()
+        this.active_conns.fetch_sub(1)
+    }
+
+    fun send_response_tcp(ref stream: TcpStream, resp: Response, is_head: bool = false) -> bool {
+        if !resp.headers.has("Content-Length") {
+            resp.headers.set("Content-Length", cast(resp.content_length(), "string"))
+        }
+
+        set status_code: int32 = resp.status
+        set reason = status_reason(resp.status)
+        set head_line = "HTTP/1.1 ${status_code} ${reason}\r\n"
+        set headers_text = resp.headers.format()
+        set full_head = "${head_line}${headers_text}\r\n"
+
+        set ok = true
+        sus {
+            stream.write(full_head)
+            if !is_head {
+                if resp.is_binary && resp.body_bytes != null {
+                    set b = resp.body_bytes ?? cast("", "bytes")
+                    if b.len() > 0 {
+                        stream.write_bytes(b.as_ptr(), b.len())
+                    }
+                } else {
+                    set txt = resp.body_text
+                    if txt.len() > 0 {
+                        stream.write(txt)
+                    }
+                }
+            }
+            stream.flush()
+        } catch {
+            rewrite ok = false
+        }
+        return ok
+    }
+
+    public fun handle_tls_connection(stream: TcpStream, client_addr: string = "127.0.0.1:0") {
+        this.active_conns.fetch_add(1)
+        stream.set_timeouts(this.timeout_ms, this.timeout_ms)
+        stream.set_nodelay(true)
+        set peer: string = if client_addr == "127.0.0.1:0" { stream.peer_addr() } else { client_addr }
+        set tls_cfg = TlsServerConfig { cert_pem: this.cert_pem, key_pem: this.key_pem }
+        set tls_opt: TlsStream? = null
+        sus {
+            rewrite tls_opt = tls_accept(ref stream, tls_cfg)
+        } catch {
+            stream.close()
+            this.active_conns.fetch_sub(1)
+            return
+        }
+        set tls = tls_opt ?? init TlsStream(0)
+
+        while this.is_running.get() {
+            set req: HttpRequest? = null
+            set parse_failed = false
+            set too_large = false
+
+            sus {
+                rewrite req = parse_tls_request_with_limit(ref tls, this.max_body_size)
+            } catch err: HttpError {
+                if err.code == 413 {
+                    rewrite too_large = true
+                } else {
+                    rewrite parse_failed = true
+                }
+            } catch {
+                rewrite parse_failed = true
+            }
+
+            if req != null {
+                set raw = req ?? init HttpRequest("GET", "/", init HttpHeaders(), "", [])
+                if raw.body.len() > this.max_body_size {
+                    rewrite too_large = true
+                }
+            }
+
+            if too_large {
+                set resp_413 = response_payload_too_large("413 Payload Too Large")
+                this.send_response_tls(ref tls, resp_413, false)
+                break
+            }
+
+            if parse_failed {
+                set bad_resp = response_bad_request("400 Bad Request")
+                this.send_response_tls(ref tls, bad_resp, false)
+                break
+            }
+
+            if req == null { break }
+            set raw_req = req ?? init HttpRequest("GET", "/", init HttpHeaders(), "", [])
+
+            set cryo_req = request_from_http(ref raw_req, peer)
+            set cryo_resp: Response? = null
+            sus {
+                rewrite cryo_resp = this.router.dispatch_with_tls_stream(cryo_req, tls, stream)
+            } catch err: ContextError {
+                set status_code: int32 = cast(400, "int32")
+                if err.code > 0 {
+                    rewrite status_code = err.code
+                }
+                rewrite cryo_resp = response_bad_request(err.message).status_code(status_code)
+            } catch {
+                set err_headers = init HttpHeaders()
+                err_headers.set("Content-Type", "text/plain; charset=utf-8")
+                rewrite cryo_resp = init Response(500, err_headers, "Internal Server Error", null, false)
+            }
+
+            set resp_val = cryo_resp ?? init Response(500, null, "Internal Server Error", null, false)
+            if resp_val.is_hijacked {
+                break
+            }
+
+            set is_head_req = raw_req.method == "HEAD"
+            set send_ok = this.send_response_tls(ref tls, resp_val, is_head_req)
+            if !send_ok { break }
+
+            set conn_hdr = raw_req.headers.get("Connection")
+            if conn_hdr != null && lower(trim(conn_hdr ?? "")) == "close" {
+                break
+            }
+        }
+        tls.close()
+        stream.close()
+        this.active_conns.fetch_sub(1)
+    }
+
+    fun send_response_tls(ref tls: TlsStream, resp: Response, is_head: bool = false) -> bool {
+        if !resp.headers.has("Content-Length") {
+            resp.headers.set("Content-Length", cast(resp.content_length(), "string"))
+        }
+        set status_code: int32 = resp.status
+        set reason = status_reason(resp.status)
+        set head_line = "HTTP/1.1 ${status_code} ${reason}\r\n"
+        set headers_text = resp.headers.format()
+        set full_head = "${head_line}${headers_text}\r\n"
+
+        set ok = true
+        sus {
+            tls.write(full_head)
+            if !is_head {
+                if resp.is_binary && resp.body_bytes != null {
+                    set b = resp.body_bytes ?? cast("", "bytes")
+                    if b.len() > 0 {
+                        tls.write_bytes(b.as_ptr(), b.len())
+                    }
+                } else {
+                    set txt = resp.body_text
+                    if txt.len() > 0 {
+                        tls.write(txt)
+                    }
+                }
+            }
+            tls.flush()
+        } catch {
+            rewrite ok = false
+        }
+        return ok
+    }
+
+    public fun accept() -> TcpStream? {
+        if this.listener == null {
+            set l = tcp_listen(this.addr)
+            rewrite this.listener = l
+            this.is_running.set(true)
+        }
+        set l = this.listener ?? init TcpListener(0)
+        sus {
+            return l.accept()
+        } catch {
+            return null
+        }
+    }
+
+    public fun listen() {
+        set l = tcp_listen(this.addr)
+        rewrite this.listener = l
+        this.is_running.set(true)
+
+        while this.is_running.get() {
+            sus {
+                set stream = l.accept()
+                set client_addr = stream.peer_addr()
+                if this.use_tls {
+                    this.handle_tls_connection(stream, client_addr)
+                } else {
+                    this.handle_connection(stream)
+                }
+            } catch err: NetError {
+                if !this.is_running.get() { break }
+            }
+        }
+    }
+
+    public fun shutdown(timeout_ms: int64 = 5000) {
+        this.is_running.set(false)
+        if this.listener != null {
+            set l = this.listener ?? init TcpListener(0)
+            l.close()
+            rewrite this.listener = null
+        }
+
+        set waited: int64 = 0
+        while this.active_conns.get() > 0 && waited < timeout_ms {
+            sleep(20u64)
+            rewrite waited += 20
+        }
+    }
+
+    public fun close() {
+        this.shutdown(1000)
+    }
+}
+
+public fun serve(addr: string, router: Router, timeout_ms: int64 = 10000, max_body_size: int64 = 2097152) {
+    set s = init Server(addr, router, timeout_ms, max_body_size)
+    s.listen()
+}
+
+public fun serve_tls(
+    addr: string,
+    router: Router,
+    cert_path: string,
+    key_path: string,
+    timeout_ms: int64 = 10000,
+    max_body_size: int64 = 2097152
+) {
+    set s = init Server(addr, router, timeout_ms, max_body_size)
+    s.enable_tls(cert_path, key_path)
+    s.listen()
+}

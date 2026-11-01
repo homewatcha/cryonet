@@ -1,0 +1,50 @@
+load ..context: Context
+load ..response: Response, response_new
+
+public class CorsConfig {
+    allow_origin: string
+    allow_methods: string
+    allow_headers: string
+    allow_credentials: bool
+    max_age: int32
+
+    public fun init(
+        allow_origin: string = "*",
+        allow_methods: string = "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD",
+        allow_headers: string = "*",
+        allow_credentials: bool = false,
+        max_age: int32 = 86400
+    ) {
+        rewrite this.allow_origin = allow_origin
+        rewrite this.allow_methods = allow_methods
+        rewrite this.allow_headers = allow_headers
+        rewrite this.allow_credentials = allow_credentials
+        rewrite this.max_age = max_age
+    }
+
+    public fun apply_headers(resp: Response) {
+        resp.header("Access-Control-Allow-Origin", this.allow_origin)
+        resp.header("Access-Control-Allow-Methods", this.allow_methods)
+        resp.header("Access-Control-Allow-Headers", this.allow_headers)
+        if this.allow_credentials {
+            resp.header("Access-Control-Allow-Credentials", "true")
+        }
+        if this.max_age > 0 {
+            resp.header("Access-Control-Max-Age", cast(this.max_age, "string"))
+        }
+    }
+}
+
+public fun cors(config: CorsConfig? = null) -> fun(Context, fun(Context) -> Response) -> Response {
+    set cfg = config ?? init CorsConfig()
+    return fun(ctx: Context, next: fun(Context) -> Response) -> Response {
+        if ctx.method() == "OPTIONS" {
+            set preflight = response_new(204, "")
+            cfg.apply_headers(preflight)
+            return preflight
+        }
+        set resp = next(ctx)
+        cfg.apply_headers(resp)
+        return resp
+    }
+}

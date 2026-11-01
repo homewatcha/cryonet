@@ -1,0 +1,214 @@
+load std.net.http_types: HttpHeaders
+load std.json: json_stringify, json_try_parse
+load std.json_parser.value: JsonValue
+load std.crypto.hmac: hmac_sha256_hex
+load .types: Cookie, cookie_format, cookie_new
+
+public class Response {
+    status: int32
+    headers: HttpHeaders
+    body_text: string
+    body_bytes: bytes?
+    is_binary: bool
+    is_hijacked: bool
+
+    public fun init(
+        status: int32 = 200,
+        headers: HttpHeaders? = null,
+        body_text: string = "",
+        body_bytes: bytes? = null,
+        is_binary: bool = false
+    ) {
+        rewrite this.status = status
+        rewrite this.headers = headers ?? init HttpHeaders()
+        rewrite this.body_text = body_text
+        rewrite this.body_bytes = body_bytes
+        rewrite this.is_binary = is_binary
+        rewrite this.is_hijacked = false
+    }
+
+    public fun set_hijacked(hijacked: bool) -> Response {
+        rewrite this.is_hijacked = hijacked
+        return this
+    }
+
+    public fun header(key: string, value: string) -> Response {
+        this.headers.set(key, value)
+        return this
+    }
+
+    public fun content_type(mime: string) -> Response {
+        this.headers.set("Content-Type", mime)
+        return this
+    }
+
+    public fun add_header(key: string, value: string) -> Response {
+        this.headers.add(key, value)
+        return this
+    }
+
+    public fun add_cookie(cookie: Cookie) -> Response {
+        set formatted = cookie_format(cookie)
+        this.headers.add("Set-Cookie", formatted)
+        return this
+    }
+
+    public fun set_cookie(cookie: Cookie) -> Response {
+        return this.add_cookie(cookie)
+    }
+
+    public fun set_signed_cookie(name: string, value: string, secret: string, path: string = "/", max_age: int64 = 86400) -> Response {
+        set k_bytes: bytes = cast(secret, "bytes")
+        set v_bytes: bytes = cast(value, "bytes")
+        set sig = hmac_sha256_hex(ref k_bytes, ref v_bytes)
+        set signed_val = "${value}.${sig}"
+        set c = cookie_new(name, signed_val)
+        rewrite c.path = path
+        rewrite c.max_age = max_age
+        return this.add_cookie(c)
+    }
+
+    public fun status_code(code: int32) -> Response {
+        rewrite this.status = code
+        return this
+    }
+
+    public fun set_body(content: string) -> Response {
+        rewrite this.body_text = content
+        rewrite this.body_bytes = null
+        rewrite this.is_binary = false
+        return this
+    }
+
+    public fun set_bytes(data: bytes) -> Response {
+        rewrite this.body_bytes = data
+        rewrite this.body_text = ""
+        rewrite this.is_binary = true
+        return this
+    }
+
+    public fun text() -> string {
+        if this.is_binary && this.body_bytes != null {
+            set b = this.body_bytes ?? cast("", "bytes")
+            return cast(b, "string")
+        }
+        return this.body_text
+    }
+
+    public fun bytes() -> bytes {
+        if this.is_binary && this.body_bytes != null {
+            return this.body_bytes ?? cast("", "bytes")
+        }
+        return cast(this.body_text, "bytes")
+    }
+
+    public fun content_length() -> int64 {
+        if this.is_binary && this.body_bytes != null {
+            set b = this.body_bytes ?? cast("", "bytes")
+            return b.len()
+        }
+        return this.body_text.len()
+    }
+
+    public fun json() -> JsonValue? {
+        set t = this.text()
+        if t.len() == 0 { return null }
+        return json_try_parse(t)
+    }
+}
+
+public fun response_new(status: int32 = 200, body: string = "") -> Response {
+    set h = init HttpHeaders()
+    return init Response(status, h, body, null, false)
+}
+
+public fun response_text(content: string, status: int32 = 200) -> Response {
+    set h = init HttpHeaders()
+    h.set("Content-Type", "text/plain; charset=utf-8")
+    return init Response(status, h, content, null, false)
+}
+
+public fun response_bytes(data: bytes, mime: string = "application/octet-stream", status: int32 = 200) -> Response {
+    set h = init HttpHeaders()
+    h.set("Content-Type", mime)
+    h.set("Content-Length", cast(data.len(), "string"))
+    return init Response(status, h, "", data, true)
+}
+
+public fun response_attachment(filename: string, data: bytes, mime: string = "application/octet-stream") -> Response {
+    set h = init HttpHeaders()
+    h.set("Content-Type", mime)
+    h.set("Content-Length", cast(data.len(), "string"))
+    h.set("Content-Disposition", "attachment; filename=\"${filename}\"")
+    return init Response(200, h, "", data, true)
+}
+
+public fun response_json(value: JsonValue, status: int32 = 200) -> Response {
+    set h = init HttpHeaders()
+    h.set("Content-Type", "application/json; charset=utf-8")
+    set body_str = json_stringify(value)
+    return init Response(status, h, body_str, null, false)
+}
+
+public fun response_json_str(raw_json: string, status: int32 = 200) -> Response {
+    set h = init HttpHeaders()
+    h.set("Content-Type", "application/json; charset=utf-8")
+    return init Response(status, h, raw_json, null, false)
+}
+
+public fun response_html(html: string, status: int32 = 200) -> Response {
+    set h = init HttpHeaders()
+    h.set("Content-Type", "text/html; charset=utf-8")
+    return init Response(status, h, html, null, false)
+}
+
+public fun response_redirect(url: string, status: int32 = 302) -> Response {
+    set h = init HttpHeaders()
+    h.set("Location", url)
+    return init Response(status, h, "", null, false)
+}
+
+public fun response_redirect_permanent(url: string) -> Response {
+    return response_redirect(url, 301)
+}
+
+public fun response_redirect_temporary(url: string) -> Response {
+    return response_redirect(url, 307)
+}
+
+public fun response_empty(status: int32 = 204) -> Response {
+    set h = init HttpHeaders()
+    return init Response(status, h, "", null, false)
+}
+
+public fun response_not_found(msg: string = "Not Found") -> Response {
+    return response_text(msg, 404)
+}
+
+public fun response_bad_request(msg: string = "Bad Request") -> Response {
+    return response_text(msg, 400)
+}
+
+public fun response_payload_too_large(msg: string = "Payload Too Large") -> Response {
+    return response_text(msg, 413)
+}
+
+public fun response_hijacked() -> Response {
+    set r = init Response(101, null, "", null, false)
+    r.set_hijacked(true)
+    return r
+}
+
+public fun response_server_error(msg: string = "Internal Server Error") -> Response {
+    return response_text(msg, 500)
+}
+
+public fun response_ndjson(lines: string[], status: int32 = 200) -> Response {
+    set body = ""
+    for i in 0..lines.len() {
+        rewrite body = "${body}${lines[i]}\n"
+    }
+    set r = response_new(status, body)
+    r.header("Content-Type", "application/x-ndjson; charset=utf-8")
+    return r
+}

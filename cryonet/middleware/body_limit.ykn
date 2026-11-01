@@ -1,0 +1,31 @@
+load std.numf: parse_base
+load ..context: Context
+load ..response: Response, response_payload_too_large
+load .pipeline: NextFn
+
+public class BodyLimitMiddleware {
+    max_bytes: int64
+
+    public fun init(max_bytes: int64) {
+        rewrite this.max_bytes = max_bytes
+    }
+
+    public fun handle(ctx: Context, next: NextFn) -> Response {
+        set cl = ctx.header("Content-Length")
+        if cl != null {
+            set parsed = parse_base(cl ?? "0", 10)
+            if parsed != null && (parsed ?? 0) > this.max_bytes {
+                return response_payload_too_large("Request payload exceeds limit")
+            }
+        }
+        if ctx.bytes().len() > this.max_bytes {
+            return response_payload_too_large("Request payload exceeds limit")
+        }
+        return next(ctx)
+    }
+}
+
+public fun body_limit(max_bytes: int64) -> fun(Context, NextFn) -> Response {
+    set bl = init BodyLimitMiddleware(max_bytes)
+    return fun(ctx: Context, next: NextFn) => bl.handle(ctx, next)
+}

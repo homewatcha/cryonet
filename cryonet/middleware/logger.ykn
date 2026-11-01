@@ -1,0 +1,20 @@
+load std.io: println
+load std.datetime: now_utc, to_unix_millis
+load ..context: Context
+load ..response: Response
+
+public fun logger_middleware(ctx: Context, next: fun(Context) -> Response) -> Response {
+    set t0_dt = now_utc()
+    set t0 = to_unix_millis(ref t0_dt)
+    set m = ctx.method()
+    set p = ctx.path()
+
+    set resp = next(ctx)
+
+    set t1_dt = now_utc()
+    set t1 = to_unix_millis(ref t1_dt)
+    set elapsed = t1 - t0
+
+    println("[cryonet] " + m + " " + p + " -> " + cast(resp.status, "string") + " (" + cast(elapsed, "string") + "ms)")
+    return resp
+}

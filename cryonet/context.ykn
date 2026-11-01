@@ -1,0 +1,738 @@
+load std.json_parser.value: JsonValue
+load std.simpleurl: QueryParam
+load std.numf: parse_base
+load std.sync: Mutex, mutex
+load std.net.tcp: TcpStream
+load std.net.tls: TlsStream
+load std.io: println
+load std.hash.common: bytes_to_hex, hex_to_bytes
+load std.crypto.hmac: hmac_sha256_hex
+load std.strings: starts_with, slice, trim, index_of, last_index_of
+load .types: Cookie, cookie_new
+load .headers: BasicAuth, HttpRange, parse_basic_auth, parse_bearer_token, parse_range_header
+load .form: Form
+load .multipart: Multipart
+load .request: Request
+load .response: Response, response_new, response_text, response_bytes, response_json, response_json_str, response_html, response_redirect, response_attachment, response_empty, response_not_found, response_bad_request, response_server_error, response_hijacked, response_ndjson
+load .realtime.websocket: WebSocketSession, is_websocket_request, websocket_upgrade_response
+load .realtime.sse: SseWriter, response_sse
+load .realtime.streaming: StreamWriter, response_chunked
+load .realtime.stream: ConnectionStream, stream_from_tcp, stream_from_tls, stream_from_tls_tcp, stream_noop
+
+cfun yukistd_map_new() -> ptr<uint8>
+cfun yukistd_map_free(m: ptr<uint8>)
+cfun yukistd_map_set(m: ptr<uint8>, k_ptr: ptr<uint8>, k_len: int64, v_ptr: ptr<uint8>, v_len: int64)
+cfun yukistd_map_get(m: ptr<uint8>, k_ptr: ptr<uint8>, k_len: int64, out_len: ptr<int64>) -> ptr<uint8>
+cfun yukistd_map_has(m: ptr<uint8>, k_ptr: ptr<uint8>, k_len: int64) -> bool
+cfun yukistd_map_del(m: ptr<uint8>, k_ptr: ptr<uint8>, k_len: int64) -> bool
+cfun yukistd_map_len(m: ptr<uint8>) -> int64
+cfun yukistd_map_clear(m: ptr<uint8>)
+
+public interface AnyState {}
+
+public struct StateEntry {
+    key: string
+    value: string
+}
+
+public class AppState {
+    lock: Mutex
+    handle: ptr<uint8>
+
+    public fun init() {
+        rewrite this.lock = mutex()
+        rewrite this.handle = yukistd_map_new()
+    }
+
+    public fun set(key: string, val: string) {
+        this.set_string(key, val)
+    }
+
+    public fun get(key: string) -> string? {
+        return this.get_string(key)
+    }
+
+    public fun set_string(key: string, val: string) {
+        this.lock.lock()
+        yukistd_map_set(this.handle, key.as_ptr(), key.len(), val.as_ptr(), val.len())
+        this.lock.unlock()
+    }
+
+    public fun get_string(key: string) -> string? {
+        this.lock.lock()
+        set out_len: int64 = 0
+        set p = yukistd_map_get(this.handle, key.as_ptr(), key.len(), ptr_of(out_len))
+        if p == null {
+            this.lock.unlock()
+            return null
+        }
+        if out_len <= 0 {
+            this.lock.unlock()
+            return ""
+        }
+        set temp = from_raw_parts(p, out_len)
+        set res: string = "" + temp
+        this.lock.unlock()
+        return res
+    }
+
+    public fun contains_key(key: string) -> bool {
+        this.lock.lock()
+        set res = yukistd_map_has(this.handle, key.as_ptr(), key.len())
+        this.lock.unlock()
+        return res
+    }
+
+    public fun remove(key: string) -> bool {
+        this.lock.lock()
+        set res = yukistd_map_del(this.handle, key.as_ptr(), key.len())
+        this.lock.unlock()
+        return res
+    }
+
+    public fun len() -> int64 {
+        this.lock.lock()
+        set res = yukistd_map_len(this.handle)
+        this.lock.unlock()
+        return res
+    }
+
+    public fun clear() {
+        this.lock.lock()
+        yukistd_map_clear(this.handle)
+        this.lock.unlock()
+    }
+
+    public fun set_int(key: string, val: int64) {
+        this.set_string(key, cast(val, "string"))
+    }
+
+    public fun get_int(key: string) -> int64? {
+        set s = this.get_string(key)
+        if s == null { return null }
+        return parse_base(s ?? "", 10)
+    }
+
+    public fun set_bool(key: string, val: bool) {
+        this.set_string(key, if val { "true" } else { "false" })
+    }
+
+    public fun get_bool(key: string) -> bool? {
+        set s = this.get_string(key)
+        if s == "true" || s == "1" { return true }
+        if s == "false" || s == "0" { return false }
+        return null
+    }
+
+    public fun set_bytes(key: string, val: bytes) {
+        set h = bytes_to_hex(ref val)
+        this.set_string(key, "hex:${h}")
+    }
+
+    public fun get_bytes(key: string) -> bytes? {
+        set s = this.get_string(key)
+        if s == null { return null }
+        set str_val = s ?? ""
+        if starts_with(str_val, "hex:") ?? false {
+            set h = slice(str_val, 4, str_val.len())
+            return hex_to_bytes(h)
+        }
+        return cast(str_val, "bytes")
+    }
+
+    public fun set_ptr(key: string, val: ptr<void>) {
+        set addr: uint64 = cast(val, "uint64")
+        set addr_str = cast(addr, "string")
+        this.set_string(key, "ptr:${addr_str}")
+    }
+
+    public fun get_ptr(key: string) -> ptr<void>? {
+        set s = this.get_string(key)
+        if s == null { return null }
+        set str_val = s ?? ""
+        if starts_with(str_val, "ptr:") ?? false {
+            set addr_str = slice(str_val, 4, str_val.len())
+            set parsed = parse_base(addr_str, 10)
+            if parsed != null {
+                set addr: uint64 = cast(parsed ?? 0, "uint64")
+                return cast(addr, "ptr<void>")
+            }
+        }
+        return null
+    }
+
+    public fun sub(prefix: string) -> SubState {
+        return init SubState(this, prefix)
+    }
+}
+
+public class SubState {
+    parent: AppState
+    prefix: string
+
+    public fun init(parent: AppState, prefix: string) {
+        rewrite this.parent = parent
+        rewrite this.prefix = prefix
+    }
+
+    fun make_key(key: string) -> string {
+        return "${this.prefix}:${key}"
+    }
+
+    public fun set(key: string, val: string) {
+        this.set_string(key, val)
+    }
+
+    public fun get(key: string) -> string? {
+        return this.get_string(key)
+    }
+
+    public fun set_string(key: string, val: string) {
+        this.parent.set_string(this.make_key(key), val)
+    }
+
+    public fun get_string(key: string) -> string? {
+        return this.parent.get_string(this.make_key(key))
+    }
+
+    public fun set_int(key: string, val: int64) {
+        this.parent.set_int(this.make_key(key), val)
+    }
+
+    public fun get_int(key: string) -> int64? {
+        return this.parent.get_int(this.make_key(key))
+    }
+
+    public fun set_bool(key: string, val: bool) {
+        this.parent.set_bool(this.make_key(key), val)
+    }
+
+    public fun get_bool(key: string) -> bool? {
+        return this.parent.get_bool(this.make_key(key))
+    }
+
+    public fun set_bytes(key: string, val: bytes) {
+        this.parent.set_bytes(this.make_key(key), val)
+    }
+
+    public fun get_bytes(key: string) -> bytes? {
+        return this.parent.get_bytes(this.make_key(key))
+    }
+
+    public fun set_ptr(key: string, val: ptr<void>) {
+        this.parent.set_ptr(this.make_key(key), val)
+    }
+
+    public fun get_ptr(key: string) -> ptr<void>? {
+        return this.parent.get_ptr(this.make_key(key))
+    }
+
+    public fun contains_key(key: string) -> bool {
+        return this.parent.contains_key(this.make_key(key))
+    }
+
+    public fun remove(key: string) -> bool {
+        return this.parent.remove(this.make_key(key))
+    }
+}
+
+public struct ContextError {
+    message: string
+    code: int32
+}
+
+public fun strip_port(addr: string) -> string {
+    set clean = trim(addr)
+    if clean.len() == 0 { return "" }
+    if starts_with(clean, "[") ?? false {
+        set close_b = index_of(clean, "]") ?? -1
+        if close_b > 1 {
+            return slice(clean, 1, close_b)
+        }
+    }
+    set first_colon = index_of(clean, ":") ?? -1
+    if first_colon >= 0 {
+        set rest = slice(clean, first_colon + 1, clean.len())
+        set second_colon = index_of(rest, ":") ?? -1
+        if second_colon >= 0 {
+            return clean
+        }
+        return slice(clean, 0, first_colon)
+    }
+    return clean
+}
+
+public class Context {
+    req: Request
+    app_state: AppState?
+    local_state: StateEntry[]
+    stream: TcpStream?
+    tls_stream: TlsStream?
+    hijacked: bool
+
+    public fun init(
+        req: Request,
+        app_state: AppState? = null,
+        stream: TcpStream? = null,
+        tls_stream: TlsStream? = null
+    ) {
+        rewrite this.req = req
+        rewrite this.app_state = app_state
+        rewrite this.local_state = []
+        rewrite this.stream = stream
+        rewrite this.tls_stream = tls_stream
+        rewrite this.hijacked = false
+    }
+
+    public fun is_hijacked() -> bool {
+        return this.hijacked
+    }
+
+    public fun set_hijacked(val: bool = true) {
+        rewrite this.hijacked = val
+    }
+
+    public fun tcp_stream() -> TcpStream? {
+        return this.stream
+    }
+
+    public fun get_tls_stream() -> TlsStream? {
+        return this.tls_stream
+    }
+
+    public fun connection_stream() -> ConnectionStream? {
+        if this.tls_stream != null {
+            set s = this.tls_stream ?? init TlsStream(0)
+            if this.stream != null {
+                set t = this.stream ?? init TcpStream(0)
+                return stream_from_tls_tcp(s, t)
+            }
+            return stream_from_tls(s)
+        }
+        if this.stream != null {
+            set s = this.stream ?? init TcpStream(0)
+            return stream_from_tcp(s)
+        }
+        return null
+    }
+
+    public fun upgrade_websocket() -> WebSocketSession? {
+        return this.upgrade_websocket_with_timeout(0)
+    }
+
+    public fun upgrade_websocket_with_timeout(timeout_ms: int64) -> WebSocketSession? {
+        if !is_websocket_request(ref this.req) {
+            return null
+        }
+        set conn = this.connection_stream()
+        set s = conn ?? stream_noop()
+        set key = this.req.header("Sec-WebSocket-Key") ?? ""
+        set resp = websocket_upgrade_response(key)
+        set status_code: int32 = resp.status
+        set head_line = "HTTP/1.1 ${status_code} Switching Protocols\r\n"
+        set headers_text = resp.headers.format()
+        set full_head = "${head_line}${headers_text}\r\n"
+        sus {
+            s.write(full_head)
+            s.flush()
+        } catch {
+            return null
+        }
+        rewrite this.hijacked = true
+        return init WebSocketSession(s, timeout_ms)
+    }
+
+    public fun start_sse() -> SseWriter {
+        set conn = this.connection_stream()
+        if conn != null {
+            set s = conn ?? stream_noop()
+            set resp = response_sse()
+            set status_code: int32 = resp.status
+            set head_line = "HTTP/1.1 ${status_code} OK\r\n"
+            set headers_text = resp.headers.format()
+            set full_head = "${head_line}${headers_text}\r\n"
+            sus {
+                s.write(full_head)
+                s.flush()
+            } catch {
+                println("sse stream error: ${errkind}")
+            }
+            rewrite this.hijacked = true
+            return init SseWriter(s)
+        }
+        rewrite this.hijacked = true
+        return init SseWriter(stream_noop())
+    }
+
+    public fun start_chunked(content_type: string = "application/octet-stream") -> StreamWriter {
+        set conn = this.connection_stream()
+        if conn != null {
+            set s = conn ?? stream_noop()
+            set resp = response_chunked(content_type)
+            set status_code: int32 = resp.status
+            set head_line = "HTTP/1.1 ${status_code} OK\r\n"
+            set headers_text = resp.headers.format()
+            set full_head = "${head_line}${headers_text}\r\n"
+            sus {
+                s.write(full_head)
+                s.flush()
+            } catch {
+                println("chunked stream error: ${errkind}")
+            }
+            rewrite this.hijacked = true
+            return init StreamWriter(s)
+        }
+        rewrite this.hijacked = true
+        return init StreamWriter(stream_noop())
+    }
+
+    public fun websocket(handler: fun(WebSocketSession) -> void) -> Response {
+        return this.websocket_with_timeout(handler, 0)
+    }
+
+    public fun websocket_with_timeout(handler: fun(WebSocketSession) -> void, timeout_ms: int64) -> Response {
+        set ws = this.upgrade_websocket_with_timeout(timeout_ms)
+        if ws == null {
+            return response_bad_request("400 Bad Request: Expected WebSocket Upgrade")
+        }
+        handler(ws ?? init WebSocketSession(stream_noop(), timeout_ms))
+        return response_hijacked()
+    }
+
+    public fun sse(handler: fun(SseWriter) -> void) -> Response {
+        set writer = this.start_sse()
+        handler(writer)
+        return response_hijacked()
+    }
+
+    public fun chunked(content_type: string, handler: fun(StreamWriter) -> void) -> Response {
+        set writer = this.start_chunked(content_type)
+        handler(writer)
+        return response_hijacked()
+    }
+
+    public fun state() -> AppState? {
+        return this.app_state
+    }
+
+    public fun app_string(key: string) -> string? {
+        if this.app_state == null { return null }
+        return (this.app_state ?? init AppState()).get_string(key)
+    }
+
+    public fun app_int(key: string) -> int64? {
+        if this.app_state == null { return null }
+        return (this.app_state ?? init AppState()).get_int(key)
+    }
+
+    public fun app_bool(key: string) -> bool? {
+        if this.app_state == null { return null }
+        return (this.app_state ?? init AppState()).get_bool(key)
+    }
+
+    public fun app_bytes(key: string) -> bytes? {
+        if this.app_state == null { return null }
+        return (this.app_state ?? init AppState()).get_bytes(key)
+    }
+
+    public fun app_ptr(key: string) -> ptr<void>? {
+        if this.app_state == null { return null }
+        return (this.app_state ?? init AppState()).get_ptr(key)
+    }
+
+    public fun substate(prefix: string) -> SubState? {
+        if this.app_state == null { return null }
+        set s = this.app_state ?? init AppState()
+        return s.sub(prefix)
+    }
+
+    public fun bearer_auth() -> string? {
+        set auth = this.req.header("Authorization")
+        if auth == null { return null }
+        return parse_bearer_token(auth ?? "")
+    }
+
+    public fun basic_auth() -> BasicAuth? {
+        set auth = this.req.header("Authorization")
+        if auth == null { return null }
+        return parse_basic_auth(auth ?? "")
+    }
+
+    public fun client_ip() -> string? {
+        return this.client_ip_opt(false)
+    }
+
+    public fun client_ip_opt(trust_proxy: bool) -> string? {
+        if trust_proxy {
+            set xff = this.req.header("X-Forwarded-For")
+            if xff != null {
+                set raw_ip = trim(xff ?? "")
+                set comma_pos = index_of(raw_ip, ",") ?? -1
+                set ip_str: string = if comma_pos > 0 { trim(slice(raw_ip, 0, comma_pos)) } else { raw_ip }
+                return strip_port(ip_str)
+            }
+            set xri = this.req.header("X-Real-IP")
+            if xri != null {
+                return strip_port(trim(xri ?? ""))
+            }
+        }
+        if this.stream != null {
+            set s = this.stream ?? init TcpStream(0)
+            return strip_port(s.peer_addr())
+        }
+        if this.req.client_addr.len() > 0 && this.req.client_addr != "127.0.0.1:0" {
+            return strip_port(this.req.client_addr)
+        }
+        return null
+    }
+
+    public fun header_range(total_len: int64) -> HttpRange? {
+        set r_hdr = this.req.header("Range")
+        if r_hdr == null { return null }
+        return parse_range_header(r_hdr ?? "", total_len)
+    }
+
+    public fun accepts(mime: string) -> bool {
+        set acc = this.req.header("Accept")
+        if acc == null { return false }
+        if (index_of(acc ?? "", "*/*") ?? -1) >= 0 { return true }
+        return (index_of(this.req.header("Accept") ?? "", mime) ?? -1) >= 0
+    }
+
+    public fun method() -> string {
+        return this.req.method
+    }
+
+    public fun path() -> string {
+        return this.req.path
+    }
+
+    public fun uri() -> string {
+        return this.req.uri
+    }
+
+    public fun original_uri() -> string {
+        return this.req.original_uri
+    }
+
+    public fun matched_path() -> string {
+        return this.req.matched_path
+    }
+
+    public fun client_addr() -> string {
+        return this.req.client_addr
+    }
+
+    public fun param(name: string) -> string? {
+        return this.req.param(name)
+    }
+
+    public fun params() -> RouteParam[] {
+        return this.req.params
+    }
+
+    public fun param_int(name: string) -> int32? {
+        return this.req.param_int(name)
+    }
+
+    public fun param_i64(name: string) -> int64? {
+        return this.req.param_i64(name)
+    }
+
+    public fun query(name: string) -> string? {
+        return this.req.query(name)
+    }
+
+    public fun query_int(name: string) -> int32? {
+        return this.req.query_int(name)
+    }
+
+    public fun query_bool(name: string) -> bool? {
+        return this.req.query_bool(name)
+    }
+
+    public fun header(name: string) -> string? {
+        return this.req.header(name)
+    }
+
+    public fun has_header(name: string) -> bool {
+        return this.req.has_header(name)
+    }
+
+    public fun queries() -> QueryParam[] {
+        return this.req.queries()
+    }
+
+    public fun bearer_token() -> string? {
+        return this.req.bearer_token()
+    }
+
+    public fun cookie(name: string) -> string? {
+        return this.req.cookie(name)
+    }
+
+    public fun raw_query() -> string? {
+        return this.req.raw_query()
+    }
+
+    public fun signed_cookie(name: string, secret: string) -> string? {
+        set c = this.cookie(name)
+        if c == null { return null }
+        set raw = c ?? ""
+        set dot_pos = last_index_of(raw, ".")
+        if dot_pos == null || (dot_pos ?? 0) <= 0 { return null }
+        set dot_idx = dot_pos ?? 0
+        set val = slice(raw, 0, dot_idx)
+        set sig = slice(raw, dot_idx + 1, raw.len())
+
+        set k_bytes: bytes = cast(secret, "bytes")
+        set v_bytes: bytes = cast(val, "bytes")
+        set expected_sig = hmac_sha256_hex(ref k_bytes, ref v_bytes)
+        if sig == expected_sig {
+            return val
+        }
+        return null
+    }
+
+    public fun cookies() -> Cookie[] {
+        return this.req.cookies()
+    }
+
+    public fun body() -> string {
+        return this.req.text()
+    }
+
+    public fun text() -> string {
+        return this.req.text()
+    }
+
+    public fun bytes() -> bytes {
+        return this.req.bytes()
+    }
+
+    public fun json() -> JsonValue? {
+        return this.req.json()
+    }
+
+    public fun json_required() -> JsonValue {
+        set val = this.req.json()
+        if val == null {
+            panic(ContextError {
+                message: "Failed to parse JSON request body: invalid or missing JSON",
+                code: 400
+            })
+        }
+        return val ?? init JsonValue()
+    }
+
+    public fun form() -> Form {
+        return this.req.form()
+    }
+
+    public fun multipart() -> Multipart {
+        return this.req.multipart()
+    }
+
+    public fun set_local(key: string, value: string) {
+        for i in 0..this.local_state.len() {
+            if this.local_state[i].key == key {
+                rewrite this.local_state[i] = StateEntry { key: key, value: value }
+                return
+            }
+        }
+        this.local_state.push(StateEntry { key: key, value: value })
+    }
+
+    public fun get_local(key: string) -> string? {
+        for i in 0..this.local_state.len() {
+            if this.local_state[i].key == key {
+                return this.local_state[i].value
+            }
+        }
+        return null
+    }
+
+    public fun set_state(key: string, value: string) {
+        this.set_local(key, value)
+    }
+
+    public fun get_state(key: string) -> string? {
+        return this.get_local(key)
+    }
+
+    public fun string(content: string) -> Response {
+        return response_text(content, 200)
+    }
+
+    public fun text_response(content: string, status: int32 = 200) -> Response {
+        return response_text(content, status)
+    }
+
+    public fun json_response(val: JsonValue, status: int32 = 200) -> Response {
+        return response_json(val, status)
+    }
+
+    public fun html_response(content: string, status: int32 = 200) -> Response {
+        return response_html(content, status)
+    }
+
+    public fun string_status(content: string, status: int32) -> Response {
+        return response_text(content, status)
+    }
+
+    public fun bytes_data(data: bytes, mime: string = "application/octet-stream") -> Response {
+        return response_bytes(data, mime, 200)
+    }
+
+    public fun bytes_status(data: bytes, mime: string, status: int32) -> Response {
+        return response_bytes(data, mime, status)
+    }
+
+    public fun json_data(val: JsonValue) -> Response {
+        return response_json(val, 200)
+    }
+
+    public fun json_data_status(val: JsonValue, status: int32) -> Response {
+        return response_json(val, status)
+    }
+
+    public fun json_str(raw_json: string) -> Response {
+        return response_json_str(raw_json, 200)
+    }
+
+    public fun json_str_status(raw_json: string, status: int32) -> Response {
+        return response_json_str(raw_json, status)
+    }
+
+    public fun html(content: string) -> Response {
+        return response_html(content, 200)
+    }
+
+    public fun ndjson(lines: string[], status: int32 = 200) -> Response {
+        return response_ndjson(lines, status)
+    }
+
+    public fun redirect(url: string, status: int32 = 302) -> Response {
+        return response_redirect(url, status)
+    }
+
+    public fun attachment(filename: string, data: bytes, mime: string = "application/octet-stream") -> Response {
+        return response_attachment(filename, data, mime)
+    }
+
+    public fun empty(status: int32 = 204) -> Response {
+        return response_empty(status)
+    }
+
+    public fun not_found(msg: string = "Not Found") -> Response {
+        return response_not_found(msg)
+    }
+
+    public fun bad_request(msg: string = "Bad Request") -> Response {
+        return response_bad_request(msg)
+    }
+
+    public fun server_error(msg: string = "Internal Server Error") -> Response {
+        return response_server_error(msg)
+    }
+}

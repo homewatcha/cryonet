@@ -1,0 +1,166 @@
+load std.strings: index_of, lower
+load std.fs.paths: path_join, path_extension, path_is_file, path_is_dir, path_exists
+load std.fs.files: open_read, file_metadata
+load .context: Context
+load .headers: HttpRange
+load .response: Response, response_new, response_bytes, response_not_found, response_bad_request
+load .method: MethodRouter, get
+
+fun read_file_bytes(path: string, size: int64) -> bytes {
+    if size <= 0 {
+        return cast("", "bytes")
+    }
+    set file = open_read(path)
+    set buf: uint8[] = []
+    buf.reserve(size)
+
+    set total_read: int64 = 0
+    while total_read < size {
+        set addr: uint64 = cast(buf.as_ptr(), "uint64") + cast(total_read, "uint64")
+        set p: ptr<uint8> = cast(addr, "ptr<uint8>")
+        set n = file.read(p, size - total_read)
+        if n <= 0 { break }
+        rewrite total_read = total_read + n
+    }
+    file.close()
+
+    if total_read <= 0 {
+        return cast("", "bytes")
+    }
+    return from_raw_parts(buf.as_ptr(), total_read, size)
+}
+
+fun guess_mime(ext: string) -> string {
+    set lower_ext = lower(ext)
+    if lower_ext == "html" || lower_ext == "htm" { return "text/html; charset=utf-8" }
+    if lower_ext == "css" { return "text/css; charset=utf-8" }
+    if lower_ext == "js" || lower_ext == "mjs" { return "application/javascript; charset=utf-8" }
+    if lower_ext == "json" { return "application/json; charset=utf-8" }
+    if lower_ext == "txt" { return "text/plain; charset=utf-8" }
+    if lower_ext == "png" { return "image/png" }
+    if lower_ext == "jpg" || lower_ext == "jpeg" { return "image/jpeg" }
+    if lower_ext == "gif" { return "image/gif" }
+    if lower_ext == "svg" { return "image/svg+xml" }
+    if lower_ext == "ico" { return "image/x-icon" }
+    if lower_ext == "webp" { return "image/webp" }
+    if lower_ext == "wasm" { return "application/wasm" }
+    if lower_ext == "xml" { return "application/xml; charset=utf-8" }
+    if lower_ext == "pdf" { return "application/pdf" }
+    if lower_ext == "zip" { return "application/zip" }
+    if lower_ext == "mp4" { return "video/mp4" }
+    if lower_ext == "mp3" { return "audio/mpeg" }
+    if lower_ext == "woff" { return "font/woff" }
+    if lower_ext == "woff2" { return "font/woff2" }
+    if lower_ext == "ttf" { return "font/ttf" }
+    if lower_ext == "otf" { return "font/otf" }
+    return "application/octet-stream"
+}
+
+public fun serve_file_response(ctx: Context, file_path: string) -> Response {
+    if !path_exists(file_path) || !path_is_file(file_path) {
+        return response_not_found("File Not Found")
+    }
+
+    set meta = file_metadata(file_path)
+    set ext = path_extension(file_path) ?? ""
+    set mime = guess_mime(ext)
+    set etag = "\"${meta.size}-${meta.modified_nanos}\""
+
+    // Check If-None-Match (304 Not Modified) before reading file body
+    set inm = ctx.header("If-None-Match")
+    if inm != null {
+        set inm_val = inm ?? ""
+        if inm_val == "*" || inm_val == etag || (index_of(inm_val, etag) ?? -1) >= 0 {
+            set res304 = response_new(304, "")
+            res304.header("ETag", etag)
+            return res304
+        }
+    }
+
+    set binary_data = read_file_bytes(file_path, meta.size)
+    set total_len = binary_data.len()
+
+    // Check Range request (206 Partial Content or 416 Range Not Satisfiable)
+    set range_hdr = ctx.header("Range")
+    if range_hdr != null {
+        set r = ctx.header_range(total_len)
+        if r != null {
+            set range = r ?? HttpRange { start: 0, end: 0, satisfiable: false }
+            if range.satisfiable {
+                set slice_len = range.end - range.start + 1
+                if slice_len > 0 && range.start < total_len {
+                    set raw_base_ptr: ptr<uint8> = binary_data.as_ptr()
+                    set addr: uint64 = cast(raw_base_ptr, "uint64") + cast(range.start, "uint64")
+                    set p: ptr<uint8> = cast(addr, "ptr<uint8>")
+                    set slice_bytes = from_raw_parts(p, slice_len, slice_len)
+                    set partial_resp = response_bytes(slice_bytes, mime, 206)
+                    partial_resp.header("Content-Range", "bytes ${range.start}-${range.end}/${total_len}")
+                    partial_resp.header("Accept-Ranges", "bytes")
+                    partial_resp.header("ETag", etag)
+                    return partial_resp
+                }
+            } else {
+                set res416 = response_new(416, "Range Not Satisfiable")
+                res416.header("Content-Range", "bytes */${total_len}")
+                res416.header("Accept-Ranges", "bytes")
+                return res416
+            }
+        }
+    }
+
+    set full_resp = response_bytes(binary_data, mime, 200)
+    full_resp.header("Accept-Ranges", "bytes")
+    full_resp.header("ETag", etag)
+    return full_resp
+}
+
+public class ServeDir {
+    root: string
+    index_file: string
+
+    public fun init(root: string, index_file: string = "index.html") {
+        rewrite this.root = root
+        rewrite this.index_file = index_file
+    }
+
+    public fun handle(ctx: Context) -> Response {
+        set req_path = ctx.param("filepath") ?? ctx.param("path") ?? ""
+        if (index_of(req_path, "..") ?? -1) >= 0 {
+            return response_bad_request("Forbidden path")
+        }
+
+        set target: string = if req_path.len() == 0 || req_path == "/" {
+            path_join(this.root, this.index_file)
+        } else {
+            path_join(this.root, req_path)
+        }
+
+        if path_exists(target) && path_is_dir(target) {
+            rewrite target = path_join(target, this.index_file)
+        }
+
+        return serve_file_response(ctx, target)
+    }
+}
+
+public fun serve_dir(root: string) -> MethodRouter {
+    set sd = init ServeDir(root)
+    return get(fun(ctx: Context) => sd.handle(ctx))
+}
+
+public class ServeFile {
+    file_path: string
+
+    public fun init(file_path: string) {
+        rewrite this.file_path = file_path
+    }
+
+    public fun handle(ctx: Context) -> Response {
+        return serve_file_response(ctx, this.file_path)
+    }
+}
+
+public fun serve_file(file_path: string) -> MethodRouter {
+    set sf = init ServeFile(file_path)
+    return get(fun(ctx: Context) => sf.handle(ctx))
+}

@@ -1,0 +1,44 @@
+load std.strings: index_of
+load std.compress: gzip, deflate_compress
+load ..context: Context
+load ..response: Response
+load .pipeline: NextFn
+
+public fun compression_middleware(ctx: Context, next: NextFn) -> Response {
+    set ae = ctx.header("Accept-Encoding")
+    set ae_str: string = if ae != null { ae ?? "" } else { "" }
+    set has_gzip = (index_of(ae_str, "gzip") ?? -1) >= 0
+    set has_deflate = (index_of(ae_str, "deflate") ?? -1) >= 0
+
+    set resp = next(ctx)
+    if resp.headers.has("Content-Encoding") || ae == null { return resp }
+
+    set body_bytes = resp.bytes()
+    if body_bytes.len() < 128 { return resp }
+
+    if has_gzip {
+        sus {
+            set compressed = gzip(body_bytes, 6)
+            resp.set_bytes(compressed)
+            resp.header("Content-Encoding", "gzip")
+            resp.header("Content-Length", cast(compressed.len(), "string"))
+            return resp
+        } catch {
+            return resp
+        }
+    }
+
+    if has_deflate {
+        sus {
+            set compressed = deflate_compress(body_bytes, 6)
+            resp.set_bytes(compressed)
+            resp.header("Content-Encoding", "deflate")
+            resp.header("Content-Length", cast(compressed.len(), "string"))
+            return resp
+        } catch {
+            return resp
+        }
+    }
+
+    return resp
+}

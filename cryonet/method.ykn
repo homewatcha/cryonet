@@ -1,0 +1,229 @@
+load .context: Context
+load .response: Response, response_new
+load .middleware.pipeline: MiddlewareFn, execute_pipeline
+
+public type HandlerFn = fun(Context) -> Response
+
+public class MethodRouter {
+    get_handler: HandlerFn?
+    post_handler: HandlerFn?
+    put_handler: HandlerFn?
+    delete_handler: HandlerFn?
+    patch_handler: HandlerFn?
+    head_handler: HandlerFn?
+    options_handler: HandlerFn?
+    any_handler: HandlerFn?
+    route_middlewares: MiddlewareFn[]
+
+    public fun init() {
+        rewrite this.get_handler = null
+        rewrite this.post_handler = null
+        rewrite this.put_handler = null
+        rewrite this.delete_handler = null
+        rewrite this.patch_handler = null
+        rewrite this.head_handler = null
+        rewrite this.options_handler = null
+        rewrite this.any_handler = null
+        rewrite this.route_middlewares = []
+    }
+
+    public fun clone() -> MethodRouter {
+        set copy = init MethodRouter()
+        rewrite copy.get_handler = this.get_handler
+        rewrite copy.post_handler = this.post_handler
+        rewrite copy.put_handler = this.put_handler
+        rewrite copy.delete_handler = this.delete_handler
+        rewrite copy.patch_handler = this.patch_handler
+        rewrite copy.head_handler = this.head_handler
+        rewrite copy.options_handler = this.options_handler
+        rewrite copy.any_handler = this.any_handler
+        set mws: MiddlewareFn[] = []
+        for i in 0..this.route_middlewares.len() {
+            mws.push(this.route_middlewares[i])
+        }
+        rewrite copy.route_middlewares = mws
+        return copy
+    }
+
+    public fun layer(mw: MiddlewareFn) -> MethodRouter {
+        this.route_middlewares.push(mw)
+        return this
+    }
+
+    public fun get(handler: HandlerFn) -> MethodRouter {
+        rewrite this.get_handler = handler
+        return this
+    }
+
+    public fun post(handler: HandlerFn) -> MethodRouter {
+        rewrite this.post_handler = handler
+        return this
+    }
+
+    public fun put(handler: HandlerFn) -> MethodRouter {
+        rewrite this.put_handler = handler
+        return this
+    }
+
+    public fun delete(handler: HandlerFn) -> MethodRouter {
+        rewrite this.delete_handler = handler
+        return this
+    }
+
+    public fun patch(handler: HandlerFn) -> MethodRouter {
+        rewrite this.patch_handler = handler
+        return this
+    }
+
+    public fun head(handler: HandlerFn) -> MethodRouter {
+        rewrite this.head_handler = handler
+        return this
+    }
+
+    public fun options(handler: HandlerFn) -> MethodRouter {
+        rewrite this.options_handler = handler
+        return this
+    }
+
+    public fun any(handler: HandlerFn) -> MethodRouter {
+        rewrite this.any_handler = handler
+        return this
+    }
+
+    public fun supports_method(m: string) -> bool {
+        if this.any_handler != null { return true }
+        if m == "GET" && this.get_handler != null { return true }
+        if m == "POST" && this.post_handler != null { return true }
+        if m == "PUT" && this.put_handler != null { return true }
+        if m == "DELETE" && this.delete_handler != null { return true }
+        if m == "PATCH" && this.patch_handler != null { return true }
+        if m == "HEAD" && (this.head_handler != null || this.get_handler != null) { return true }
+        if m == "OPTIONS" && this.options_handler != null { return true }
+        return false
+    }
+
+    public fun allowed_methods() -> string[] {
+        set res: string[] = []
+        if this.any_handler != null {
+            res.push("GET")
+            res.push("POST")
+            res.push("PUT")
+            res.push("DELETE")
+            res.push("PATCH")
+            res.push("HEAD")
+            res.push("OPTIONS")
+            return res
+        }
+        if this.get_handler != null { res.push("GET") }
+        if this.post_handler != null { res.push("POST") }
+        if this.put_handler != null { res.push("PUT") }
+        if this.delete_handler != null { res.push("DELETE") }
+        if this.patch_handler != null { res.push("PATCH") }
+        if this.head_handler != null || this.get_handler != null { res.push("HEAD") }
+        res.push("OPTIONS")
+        return res
+    }
+
+    public fun handle(ctx: Context) -> Response? {
+        set m = ctx.method()
+        set target_fn: HandlerFn? = null
+        set is_head_from_get = false
+
+        if m == "GET" { rewrite target_fn = this.get_handler }
+        if m == "POST" { rewrite target_fn = this.post_handler }
+        if m == "PUT" { rewrite target_fn = this.put_handler }
+        if m == "DELETE" { rewrite target_fn = this.delete_handler }
+        if m == "PATCH" { rewrite target_fn = this.patch_handler }
+        if m == "HEAD" {
+            if this.head_handler != null {
+                rewrite target_fn = this.head_handler
+            } else {
+                if this.get_handler != null {
+                    rewrite target_fn = this.get_handler
+                    rewrite is_head_from_get = true
+                }
+            }
+        }
+        if m == "OPTIONS" {
+            if this.options_handler != null {
+                rewrite target_fn = this.options_handler
+            } else {
+                set opt_res = response_new(204, "")
+                set allowed = this.allowed_methods()
+                set allow_header = ""
+                for i in 0..allowed.len() {
+                    if i > 0 { rewrite allow_header = "${allow_header}, " }
+                    rewrite allow_header = "${allow_header}${allowed[i]}"
+                }
+                opt_res.header("Allow", allow_header)
+                return opt_res
+            }
+        }
+
+        if target_fn == null && this.any_handler != null {
+            rewrite target_fn = this.any_handler
+        }
+
+        if target_fn != null {
+            set h = target_fn ?? fun(c: Context) => response_new(200, "")
+            set resp: Response = if this.route_middlewares.len() > 0 {
+                execute_pipeline(ctx, this.route_middlewares, h)
+            } else {
+                h(ctx)
+            }
+            if is_head_from_get {
+                if !resp.headers.has("Content-Length") {
+                    resp.headers.set("Content-Length", cast(resp.content_length(), "string"))
+                }
+                resp.set_body("")
+            }
+            return resp
+        }
+
+        return null
+    }
+}
+
+public fun method_router() -> MethodRouter {
+    return init MethodRouter()
+}
+
+public fun get(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.get(handler)
+}
+
+public fun post(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.post(handler)
+}
+
+public fun put(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.put(handler)
+}
+
+public fun delete(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.delete(handler)
+}
+
+public fun patch(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.patch(handler)
+}
+
+public fun head(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.head(handler)
+}
+
+public fun options(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.options(handler)
+}
+
+public fun any(handler: HandlerFn) -> MethodRouter {
+    set mr = init MethodRouter()
+    return mr.any(handler)
+}

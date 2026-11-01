@@ -1,0 +1,92 @@
+load std.strings: split
+load std.net.tcp: TcpStream
+load std.net.tls: TlsStream
+load ..response: Response, response_new
+load .stream: ConnectionStream, stream_from_tcp, stream_from_tls, stream_from_tls_tcp
+
+public struct SseEvent {
+    event: string?
+    data: string
+    id: string?
+    retry: int64?
+}
+
+public fun sse_event_new(data: string, event: string? = null, id: string? = null, retry: int64? = null) -> SseEvent {
+    return SseEvent {
+        event: event,
+        data: data,
+        id: id,
+        retry: retry
+    }
+}
+
+public fun format_sse_event(e: SseEvent) -> string {
+    set res = ""
+    if e.id != null {
+        set id_val = e.id ?? ""
+        rewrite res = "${res}id: ${id_val}\n"
+    }
+    if e.event != null {
+        set ev_val = e.event ?? ""
+        rewrite res = "${res}event: ${ev_val}\n"
+    }
+    if e.retry != null {
+        set retry_val = e.retry ?? 0
+        rewrite res = "${res}retry: ${retry_val}\n"
+    }
+    set lines = split(e.data, "\n")
+    for i in 0..lines.len() {
+        set line = lines[i]
+        rewrite res = "${res}data: ${line}\n"
+    }
+    rewrite res = "${res}\n"
+    return res
+}
+
+public fun response_sse() -> Response {
+    set resp = response_new(200, "")
+    resp.header("Content-Type", "text/event-stream")
+    resp.header("Cache-Control", "no-cache")
+    resp.header("Connection", "keep-alive")
+    return resp
+}
+
+public fun sse_writer_from_tcp(stream: TcpStream) -> SseWriter {
+    return init SseWriter(stream_from_tcp(stream))
+}
+
+public fun sse_writer_from_tls(tls: TlsStream, stream: TcpStream? = null) -> SseWriter {
+    if stream != null {
+        set s = stream ?? init TcpStream(0)
+        return init SseWriter(stream_from_tls_tcp(tls, s))
+    }
+    return init SseWriter(stream_from_tls(tls))
+}
+
+public class SseWriter {
+    stream: ConnectionStream
+
+    public fun init(stream: ConnectionStream) {
+        rewrite this.stream = stream
+    }
+
+    public fun send(event: SseEvent) -> bool {
+        set payload = format_sse_event(event)
+        set ok = true
+        sus {
+            this.stream.write(payload)
+            this.stream.flush()
+        } catch {
+            rewrite ok = false
+        }
+        return ok
+    }
+
+    public fun send_data(data: string) -> bool {
+        return this.send(sse_event_new(data))
+    }
+
+    public fun close() {
+        this.stream.close()
+    }
+}

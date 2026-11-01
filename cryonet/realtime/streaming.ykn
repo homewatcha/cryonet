@@ -1,0 +1,111 @@
+load std.net.tcp: TcpStream
+load std.net.tls: TlsStream
+load ..response: Response, response_new
+load .stream: ConnectionStream, stream_from_tcp, stream_from_tls, stream_from_tls_tcp
+
+fun to_hex_i64(val: int64) -> string {
+    if val == 0 { return "0" }
+    static HEX: string = "0123456789abcdef"
+    set v = val
+    set res = ""
+    while v > 0 {
+        set rem = v % 16
+        set ch = load_hex_char(rem)
+        rewrite res = "${ch}${res}"
+        rewrite v = v / 16
+    }
+    return res
+}
+
+fun load_hex_char(rem: int64) -> string {
+    if rem == 0 { return "0" }
+    if rem == 1 { return "1" }
+    if rem == 2 { return "2" }
+    if rem == 3 { return "3" }
+    if rem == 4 { return "4" }
+    if rem == 5 { return "5" }
+    if rem == 6 { return "6" }
+    if rem == 7 { return "7" }
+    if rem == 8 { return "8" }
+    if rem == 9 { return "9" }
+    if rem == 10 { return "a" }
+    if rem == 11 { return "b" }
+    if rem == 12 { return "c" }
+    if rem == 13 { return "d" }
+    if rem == 14 { return "e" }
+    if rem == 15 { return "f" }
+    return "0"
+}
+
+public fun response_chunked(content_type: string = "application/octet-stream") -> Response {
+    set resp = response_new(200, "")
+    resp.header("Transfer-Encoding", "chunked")
+    resp.header("Content-Type", content_type)
+    return resp
+}
+
+public fun stream_writer_from_tcp(stream: TcpStream) -> StreamWriter {
+    return init StreamWriter(stream_from_tcp(stream))
+}
+
+public fun stream_writer_from_tls(tls: TlsStream, stream: TcpStream? = null) -> StreamWriter {
+    if stream != null {
+        set s = stream ?? init TcpStream(0)
+        return init StreamWriter(stream_from_tls_tcp(tls, s))
+    }
+    return init StreamWriter(stream_from_tls(tls))
+}
+
+public class StreamWriter {
+    stream: ConnectionStream
+
+    public fun init(stream: ConnectionStream) {
+        rewrite this.stream = stream
+    }
+
+    public fun write_chunk(data: string) -> bool {
+        set len = data.len()
+        if len == 0 { return true }
+        set hex_len = to_hex_i64(len)
+        set chunk = "${hex_len}\r\n${data}\r\n"
+        set ok = true
+        sus {
+            this.stream.write(chunk)
+            this.stream.flush()
+        } catch {
+            rewrite ok = false
+        }
+        return ok
+    }
+
+    public fun write_chunk_bytes(data: bytes) -> bool {
+        set len = data.len()
+        if len == 0 { return true }
+        set hex_len = to_hex_i64(len)
+        set ok = true
+        sus {
+            this.stream.write("${hex_len}\r\n")
+            this.stream.write_bytes(data.as_ptr(), len)
+            this.stream.write("\r\n")
+            this.stream.flush()
+        } catch {
+            rewrite ok = false
+        }
+        return ok
+    }
+
+    public fun finish() -> bool {
+        set ok = true
+        sus {
+            this.stream.write("0\r\n\r\n")
+            this.stream.flush()
+        } catch {
+            rewrite ok = false
+        }
+        return ok
+    }
+
+    public fun close() {
+        this.stream.close()
+    }
+}
