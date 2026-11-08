@@ -1,3 +1,4 @@
+load core.utils: cast
 load std.strings: split, trim, starts_with, ends_with, slice, index_of
 load std.net.tcp: TcpStream
 load std.net.tls: TlsStream
@@ -68,7 +69,8 @@ public class Route {
                 if starts_with(s, ":") ?? false {
                     rewrite score += 100
                 } else {
-                    if (starts_with(s, "{") ?? false) && (ends_with(s, "}") ?? false) {
+                    set is_braced = (starts_with(s, "{") ?? false) && (ends_with(s, "}") ?? false)
+                    if is_braced {
                         rewrite score += 100
                     } else {
                         rewrite score += 1000
@@ -91,7 +93,8 @@ public class Route {
                     set param_name = slice(seg, 1, seg.len())
                     out_params.push(RouteParam { name: param_name, value: req_seg })
                 } else {
-                    if (starts_with(seg, "{") ?? false) && (ends_with(seg, "}") ?? false) {
+                    set is_braced = (starts_with(seg, "{") ?? false) && (ends_with(seg, "}") ?? false)
+                    if is_braced {
                         set param_name = slice(seg, 1, seg.len() - 1)
                         out_params.push(RouteParam { name: param_name, value: req_seg })
                     } else {
@@ -113,7 +116,8 @@ public class Route {
                 set param_name = slice(seg, 1, seg.len())
                 out_params.push(RouteParam { name: param_name, value: req_seg })
             } else {
-                if (starts_with(seg, "{") ?? false) && (ends_with(seg, "}") ?? false) {
+                set is_braced = (starts_with(seg, "{") ?? false) && (ends_with(seg, "}") ?? false)
+                if is_braced {
                     set param_name = slice(seg, 1, seg.len() - 1)
                     out_params.push(RouteParam { name: param_name, value: req_seg })
                 } else {

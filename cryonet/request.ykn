@@ -1,3 +1,4 @@
+load core.utils: cast
 load std.net.http_types: HttpHeaders
 load std.simpleurl: QueryParam, parse_query
 load std.json: json_try_parse
@@ -5,6 +6,7 @@ load std.json_parser.value: JsonValue
 load std.strings: starts_with, slice, trim, index_of
 load std.numf: parse_base
 load .types: Cookie, cookie_parse
+load .headers: BasicAuth, parse_basic_auth, parse_bearer_token
 load .form: Form, parse_form
 load .multipart: Multipart, parse_multipart, parse_multipart_bytes
 
@@ -182,11 +184,13 @@ public class Request {
     public fun bearer_token() -> string? {
         set auth = this.header("Authorization")
         if auth == null { return null }
-        set s = trim(auth ?? "")
-        if starts_with(s, "Bearer ") ?? false {
-            return trim(slice(s, 7, s.len()))
-        }
-        return null
+        return parse_bearer_token(auth ?? "")
+    }
+
+    public fun basic_auth() -> BasicAuth? {
+        set auth = this.header("Authorization")
+        if auth == null { return null }
+        return parse_basic_auth(auth ?? "")
     }
 
     public fun text() -> string {

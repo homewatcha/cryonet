@@ -1,3 +1,4 @@
+load core.utils: cast
 load std.io: println
 load std.datetime: now_utc, to_unix_millis
 load ..context: Context

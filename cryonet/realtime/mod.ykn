@@ -1,5 +1,5 @@
 public load .stream: ConnectionStream, stream_from_tcp, stream_from_tls, stream_from_tls_tcp, stream_noop
-public load .crypto: base64_encode, sha1
-public load .websocket: WsMessage, WebSocketSession, is_websocket_request, websocket_accept_key, websocket_upgrade_response
+public load .crypto: base64_encode, base64_decode, sha1
+public load .websocket: WsMessage, WsFrame, WebSocketSession, is_websocket_request, websocket_accept_key, websocket_upgrade_response, websocket_upgrade, websocket_session_from_tcp, websocket_session_from_tls
 public load .sse: SseEvent, SseWriter, sse_event_new, format_sse_event, response_sse
 public load .streaming: StreamWriter, response_chunked

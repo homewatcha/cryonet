@@ -1,3 +1,5 @@
+load core.mem: from_raw_parts
+load core.utils: cast
 load std.strings: lower, trim, index_of
 load std.net.tcp: TcpStream
 load std.net.tls: TlsStream
@@ -108,10 +110,9 @@ public class WebSocketSession {
     public fun close(code: int32 = 1000) -> bool {
         set b0: uint8 = cast((code >> 8) & 0xFF, "uint8")
         set b1: uint8 = cast(code & 0xFF, "uint8")
-        set ch0 = cast(b0, "char")
-        set ch1 = cast(b1, "char")
-        set payload_str = "${ch0}${ch1}"
-        set ok = this.send_frame(8, cast(payload_str, "bytes"), true)
+        set code_bytes: uint8[] = [b0, b1]
+        set payload = cast(from_raw_parts(code_bytes.as_ptr(), 2), "bytes")
+        set ok = this.send_frame(8, payload, true)
         this.stream.close()
         return ok
     }
@@ -139,15 +140,9 @@ public class WebSocketSession {
             }
         }
 
-        set head_str = ""
-        for i in 0..head_bytes.len() {
-            set ch = cast(head_bytes[i], "char")
-            rewrite head_str = "${head_str}${ch}"
-        }
-
         set ok = true
         sus {
-            this.stream.write(head_str)
+            this.stream.write_bytes(head_bytes.as_ptr(), head_bytes.len())
             if len > 0 {
                 this.stream.write_bytes(payload.as_ptr(), len)
             }
@@ -207,20 +202,21 @@ public class WebSocketSession {
             rewrite raw_payload = "${raw_payload}${chunk}"
         }
 
-        set out_str = ""
+        set out_arr: uint8[] = []
         if is_masked {
             for i in 0..raw_payload.len() {
                 set b: uint8 = cast(raw_payload[i], "uint8")
                 set m_byte = mask[i % 4]
                 set unmasked: uint8 = b ^ m_byte
-                set ch = cast(unmasked, "char")
-                rewrite out_str = "${out_str}${ch}"
+                out_arr.push(unmasked)
             }
         } else {
-            rewrite out_str = raw_payload
+            for i in 0..raw_payload.len() {
+                out_arr.push(cast(raw_payload[i], "uint8"))
+            }
         }
 
-        set out_bytes: bytes = cast(out_str, "bytes")
+        set out_bytes: bytes = cast(from_raw_parts(out_arr.as_ptr(), out_arr.len()), "bytes")
         return WsFrame {
             fin: fin,
             opcode: opcode,

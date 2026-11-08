@@ -1,3 +1,6 @@
+load core.mem: from_raw_parts, ptr_of
+load core.panic: panic
+load core.utils: cast
 load std.json_parser.value: JsonValue
 load std.simpleurl: QueryParam
 load std.numf: parse_base
@@ -54,53 +57,60 @@ public class AppState {
 
     public fun set_string(key: string, val: string) {
         this.lock.lock()
+        defer {
+            this.lock.unlock()
+        }
         yukistd_map_set(this.handle, key.as_ptr(), key.len(), val.as_ptr(), val.len())
-        this.lock.unlock()
     }
 
     public fun get_string(key: string) -> string? {
         this.lock.lock()
+        defer {
+            this.lock.unlock()
+        }
         set out_len: int64 = 0
         set p = yukistd_map_get(this.handle, key.as_ptr(), key.len(), ptr_of(out_len))
         if p == null {
-            this.lock.unlock()
             return null
         }
         if out_len <= 0 {
-            this.lock.unlock()
             return ""
         }
         set temp = from_raw_parts(p, out_len)
         set res: string = "" + temp
-        this.lock.unlock()
         return res
     }
 
     public fun contains_key(key: string) -> bool {
         this.lock.lock()
-        set res = yukistd_map_has(this.handle, key.as_ptr(), key.len())
-        this.lock.unlock()
-        return res
+        defer {
+            this.lock.unlock()
+        }
+        return yukistd_map_has(this.handle, key.as_ptr(), key.len())
     }
 
     public fun remove(key: string) -> bool {
         this.lock.lock()
-        set res = yukistd_map_del(this.handle, key.as_ptr(), key.len())
-        this.lock.unlock()
-        return res
+        defer {
+            this.lock.unlock()
+        }
+        return yukistd_map_del(this.handle, key.as_ptr(), key.len())
     }
 
     public fun len() -> int64 {
         this.lock.lock()
-        set res = yukistd_map_len(this.handle)
-        this.lock.unlock()
-        return res
+        defer {
+            this.lock.unlock()
+        }
+        return yukistd_map_len(this.handle)
     }
 
     public fun clear() {
         this.lock.lock()
+        defer {
+            this.lock.unlock()
+        }
         yukistd_map_clear(this.handle)
-        this.lock.unlock()
     }
 
     public fun set_int(key: string, val: int64) {
@@ -495,8 +505,10 @@ public class Context {
     public fun accepts(mime: string) -> bool {
         set acc = this.req.header("Accept")
         if acc == null { return false }
-        if (index_of(acc ?? "", "*/*") ?? -1) >= 0 { return true }
-        return (index_of(this.req.header("Accept") ?? "", mime) ?? -1) >= 0
+        set acc_val = acc ?? ""
+        set has_wildcard = (index_of(acc_val.cp(), "*/*") ?? -1) >= 0
+        if has_wildcard { return true }
+        return (index_of(acc_val, mime) ?? -1) >= 0
     }
 
     public fun method() -> string {
@@ -623,6 +635,39 @@ public class Context {
             })
         }
         return val ?? init JsonValue()
+    }
+
+    public fun param_required(name: string) -> string {
+        set val = this.param(name)
+        if val == null {
+            panic(ContextError {
+                message: "Missing required route parameter '${name}'",
+                code: 400
+            })
+        }
+        return val ?? ""
+    }
+
+    public fun query_required(name: string) -> string {
+        set val = this.query(name)
+        if val == null {
+            panic(ContextError {
+                message: "Missing required query parameter '${name}'",
+                code: 400
+            })
+        }
+        return val ?? ""
+    }
+
+    public fun header_required(name: string) -> string {
+        set val = this.header(name)
+        if val == null {
+            panic(ContextError {
+                message: "Missing required header '${name}'",
+                code: 400
+            })
+        }
+        return val ?? ""
     }
 
     public fun form() -> Form {

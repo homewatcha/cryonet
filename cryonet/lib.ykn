@@ -11,7 +11,7 @@ public load .multipart: Multipart, MultipartPart, parse_multipart, parse_multipa
 public load .server: Server, serve, serve_tls, request_from_http
 public load .realtime.stream: ConnectionStream, stream_from_tcp, stream_from_tls, stream_from_tls_tcp, stream_noop
 public load .realtime.crypto: base64_encode, base64_decode, sha1
-public load .realtime.websocket: WsMessage, WsFrame, WebSocketSession, is_websocket_request, websocket_accept_key, websocket_upgrade_response, websocket_upgrade
+public load .realtime.websocket: WsMessage, WsFrame, WebSocketSession, is_websocket_request, websocket_accept_key, websocket_upgrade_response, websocket_upgrade, websocket_session_from_tcp, websocket_session_from_tls
 public load .realtime.sse: SseEvent, SseWriter, sse_event_new, format_sse_event, response_sse
 public load .realtime.streaming: StreamWriter, response_chunked
 public load .middleware.pipeline: MiddlewareFn, execute_pipeline

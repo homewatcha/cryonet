@@ -1,4 +1,5 @@
-load std.strings: slice, index_of, trim, starts_with, split
+load core.utils: cast
+load std.strings: slice, index_of, trim, starts_with, split, lower
 load std.numf: parse_base
 load .realtime.crypto: base64_decode
 
@@ -15,7 +16,8 @@ public struct HttpRange {
 
 public fun parse_basic_auth(auth_header: string) -> BasicAuth? {
     set h = trim(auth_header)
-    if !(starts_with(h, "Basic ") ?? false) && !(starts_with(h, "basic ") ?? false) {
+    set low = lower(h)
+    if !(starts_with(low, "basic ") ?? false) {
         return null
     }
     set b64 = trim(slice(h, 6, h.len()))
@@ -34,7 +36,8 @@ public fun parse_basic_auth(auth_header: string) -> BasicAuth? {
 
 public fun parse_bearer_token(auth_header: string) -> string? {
     set h = trim(auth_header)
-    if (starts_with(h, "Bearer ") ?? false) || (starts_with(h, "bearer ") ?? false) {
+    set low = lower(h)
+    if starts_with(low, "bearer ") ?? false {
         return trim(slice(h, 7, h.len()))
     }
     return null

@@ -1,3 +1,5 @@
+load core.mem: from_raw_parts
+load core.utils: cast
 load std.strings: split, trim, index_of, index_of_from, slice, starts_with
 
 public struct MultipartPart {
@@ -80,7 +82,8 @@ public fun parse_multipart_bytes(raw_bytes: bytes, content_type_header: string) 
     if bound_idx != null {
         set b_pos = bound_idx ?? 0
         set raw_boundary = trim(slice(content_type_header, b_pos + bound_tag.len(), content_type_header.len()))
-        rewrite boundary = if (starts_with(raw_boundary, "\"") ?? false) && raw_boundary.len() > 1 {
+        set is_quoted = (starts_with(raw_boundary, "\"") ?? false) && raw_boundary.len() > 1
+        rewrite boundary = if is_quoted {
             slice(raw_boundary, 1, raw_boundary.len() - 1)
         } else {
             raw_boundary

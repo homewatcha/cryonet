@@ -1,3 +1,5 @@
+load core.mem: from_raw_parts
+load core.utils: cast
 load std.strings: split, trim, index_of, slice
 load std.numf: parse_base
 
@@ -14,13 +16,13 @@ fun hex_digit(c: uint8) -> int32 {
 }
 
 public fun url_decode(s: string) -> string {
-    set res = ""
+    set out_bytes: uint8[] = []
     set i: int64 = 0
     set n = s.len()
     while i < n {
         set c: uint8 = cast(s[i], "uint8")
         if c == 43 { // '+'
-            rewrite res = "${res} "
+            out_bytes.push(32u8)
             rewrite i += 1
         } else {
             if c == 37 && i + 2 < n { // '%'
@@ -28,18 +30,16 @@ public fun url_decode(s: string) -> string {
                 set d2 = hex_digit(cast(s[i + 2], "uint8"))
                 if d1 >= 0 && d2 >= 0 {
                     set byte_val: uint8 = cast((d1 * 16) + d2, "uint8")
-                    set ch = cast(byte_val, "char")
-                    rewrite res = "${res}${ch}"
+                    out_bytes.push(byte_val)
                     rewrite i += 3
                     continue
                 }
             }
-            set ch = cast(c, "char")
-            rewrite res = "${res}${ch}"
+            out_bytes.push(c)
             rewrite i += 1
         }
     }
-    return res
+    return cast(from_raw_parts(out_bytes.as_ptr(), out_bytes.len()), "string")
 }
 
 public class Form {

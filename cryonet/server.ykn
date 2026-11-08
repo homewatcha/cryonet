@@ -1,3 +1,4 @@
+load core.utils: cast
 load std.net.tcp: TcpListener, TcpStream, tcp_listen
 load std.net.tls: TlsStream, TlsServerConfig, tls_accept
 load std.net.errors: NetError, HttpError
@@ -83,11 +84,17 @@ public class Server {
 
     public fun handle_connection(stream: TcpStream) {
         this.active_conns.fetch_add(1)
+        defer {
+            this.active_conns.fetch_sub(1)
+        }
+        defer {
+            stream.close()
+        }
         stream.set_timeouts(this.timeout_ms, this.timeout_ms)
         stream.set_nodelay(true)
         set client_addr = stream.peer_addr()
 
-        while this.is_running.get() {
+        while region this.is_running.get() {
             set req: HttpRequest? = null
             set parse_failed = false
             set too_large = false
@@ -156,9 +163,6 @@ public class Server {
                 break
             }
         }
-
-        stream.close()
-        this.active_conns.fetch_sub(1)
     }
 
     fun send_response_tcp(ref stream: TcpStream, resp: Response, is_head: bool = false) -> bool {
@@ -197,6 +201,12 @@ public class Server {
 
     public fun handle_tls_connection(stream: TcpStream, client_addr: string = "127.0.0.1:0") {
         this.active_conns.fetch_add(1)
+        defer {
+            this.active_conns.fetch_sub(1)
+        }
+        defer {
+            stream.close()
+        }
         stream.set_timeouts(this.timeout_ms, this.timeout_ms)
         stream.set_nodelay(true)
         set peer: string = if client_addr == "127.0.0.1:0" { stream.peer_addr() } else { client_addr }
@@ -205,13 +215,14 @@ public class Server {
         sus {
             rewrite tls_opt = tls_accept(ref stream, tls_cfg)
         } catch {
-            stream.close()
-            this.active_conns.fetch_sub(1)
             return
         }
         set tls = tls_opt ?? init TlsStream(0)
+        defer {
+            tls.close()
+        }
 
-        while this.is_running.get() {
+        while region this.is_running.get() {
             set req: HttpRequest? = null
             set parse_failed = false
             set too_large = false
@@ -280,9 +291,6 @@ public class Server {
                 break
             }
         }
-        tls.close()
-        stream.close()
-        this.active_conns.fetch_sub(1)
     }
 
     fun send_response_tls(ref tls: TlsStream, resp: Response, is_head: bool = false) -> bool {
@@ -337,7 +345,7 @@ public class Server {
         rewrite this.listener = l
         this.is_running.set(true)
 
-        while this.is_running.get() {
+        while region this.is_running.get() {
             sus {
                 set stream = l.accept()
                 set client_addr = stream.peer_addr()

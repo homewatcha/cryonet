@@ -1,3 +1,4 @@
+load core.utils: cast
 load std.strings: index_of
 load std.compress: gzip, deflate_compress
 load ..context: Context

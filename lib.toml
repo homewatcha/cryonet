@@ -4,4 +4,4 @@ version = "0.1.0"
 entry = "cryonet/lib.ykn"
 yukino = ["0.1.0", "+"]
 output = "static"
-includes = ["stdlib"]
+includes = ["core", "stdlib"]
