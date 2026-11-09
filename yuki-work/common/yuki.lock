@@ -1,0 +1,11 @@
+version = 1
+target = "x86_64-unknown-linux-gnu"
+compiler = "0.1.0"
+profile = "debug"
+
+[[package]]
+name = "cryonet"
+version = "0.1.1"
+kind = "static"
+source = "root"
+checksum = "blake3:19f4132a1aabf069042c05088391fc31092ade474f29b1d5dd795dc1a26f1a3e"

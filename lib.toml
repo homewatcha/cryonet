@@ -1,7 +1,7 @@
 [lib]
 name = "cryonet"
-version = "0.1.0"
+version = "0.1.1"
 entry = "cryonet/lib.ykn"
 yukino = ["0.1.0", "+"]
 output = "static"
-includes = ["stdlib"]
+includes = ["stdlib", "core"]
