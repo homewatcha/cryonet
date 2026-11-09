@@ -26,7 +26,7 @@ Add `cryonet` to your project manifest under the `[libs.runtime]` section in `yu
 
 ```toml
 [libs.runtime]
-cryonet = { git = "https://github.com/homewatcha/cryonet", tag = "0.1.0" }
+cryonet = { git = "https://github.com/homewatcha/cryonet", tag = "0.1.1" }
 ```
 
 Or reference a local workspace path during development:

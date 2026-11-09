@@ -40,7 +40,7 @@
 
 ```toml
 [libs.runtime]
-cryonet = { git = "https://github.com/homewatcha/cryonet", tag = "0.1.0", path = "cryonet" }
+cryonet = { git = "https://github.com/homewatcha/cryonet", tag = "0.1.1", path = "cryonet" }
 ```
 
 Либо укажите локальный путь при разработке в монорепозитории:
